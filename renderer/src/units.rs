@@ -32,12 +32,12 @@ use glam::{Mat4, Vec3A};
 pub const STACK: usize = 64;
 /// The still walk's stack in a kernel without units, and how much of the module's the still walk uses in one with.
 pub const STILL_STACK: usize = bvh::STACK;
-/// The deepest top tree (levels below the root): a built tree is no deeper than 18, whatever its units' boxes
+/// The deepest top tree (levels below the root): a built tree is no deeper than 19, whatever its units' boxes
 /// (`build_sah`), and the top tree is one, or a root over two (`Kept`).
-pub const TOP_DEPTH: usize = 19;
-/// The deepest mesh tree (45): what the stack has left. SAH trees deeper than this are rebuilt by median splits.
+pub const TOP_DEPTH: usize = 20;
+/// The deepest mesh tree (44): what the stack has left. SAH trees deeper than this are rebuilt by median splits.
 pub const MESH_DEPTH: usize = STACK - TOP_DEPTH;
-/// The most units a top tree holds: 2^18, what a built tree's depth has room for.
+/// The most units a top tree holds: 2^19 (524,288), what a built tree's depth has room for.
 pub const MAX_UNITS: usize = 1 << (TOP_DEPTH - 1);
 /// A leaf's most triangles (bvh.rs builds leaves of up to 16).
 pub const MAX_LEAF: u32 = 16;
@@ -280,9 +280,7 @@ pub fn top_tree(units: &[UnitBox]) -> Result<Vec<GpuNode>, String> {
     if units.is_empty() {
         return Err("a top tree needs a unit".into());
     }
-    if units.len() > MAX_UNITS {
-        return Err(format!("{} units: more than a top tree holds ({MAX_UNITS})", units.len()));
-    }
+    check_unit_capacity(units.len())?;
     if units.iter().any(|u| !(u.lo.is_finite() && u.hi.is_finite())) {
         return Err("a unit's box is not finite".into());
     }
@@ -294,6 +292,15 @@ pub fn top_tree(units: &[UnitBox]) -> Result<Vec<GpuNode>, String> {
     let records: std::collections::HashSet<u32> = units.iter().map(|u| u.record).collect();
     check_top(&nodes, |r| records.contains(&r))?;
     Ok(nodes)
+}
+
+/// Checks the bounded top-tree capacity before allocating or preparing a scene. Zero is within the capacity;
+/// `top_tree` separately requires a nonempty tree. Hosts can reject an oversized scene instead of flattening it.
+pub fn check_unit_capacity(count: usize) -> Result<(), String> {
+    if count > MAX_UNITS {
+        return Err(format!("{count} units: more than a top tree holds ({MAX_UNITS})"));
+    }
+    Ok(())
 }
 
 /// A unit's record: the instance's (`scene::Instance::gpu`), with, in the three words the normal rows leave unused
@@ -1240,7 +1247,83 @@ mod tests {
         );
         // What the stack and the record's words are here is what they are there.
         assert_eq!((STACK, STILL_STACK), (64, 48));
-        assert!(TOP_DEPTH + MESH_DEPTH <= STACK && STILL_STACK <= STACK, "one stack holds each walk");
+        assert_eq!((TOP_DEPTH, MESH_DEPTH, MAX_UNITS), (20, 44, 524_288));
+        assert_eq!(TOP_DEPTH + MESH_DEPTH, STACK, "both levels share the unchanged shader stack");
+        assert!(STILL_STACK <= STACK, "one stack holds each walk");
+    }
+
+    /// A deliberately unbalanced, valid tree with one pending sibling per level. All boxes overlap, so a ray
+    /// crossing the box must actually push every level; ordinary balanced fixtures seldom reach the stack bound.
+    fn depth_chain(depth: usize) -> Vec<GpuNode> {
+        let leaf = GpuNode { bmin: [-1.0; 3], left_or_first: 0, bmax: [1.0; 3], count: 1 };
+        let mut nodes = vec![leaf];
+        let mut next = 0;
+        for k in 0..depth {
+            let left = nodes.len();
+            nodes[next] = GpuNode { left_or_first: left as u32, count: 0, ..leaf };
+            nodes.push(leaf);
+            nodes.push(GpuNode { left_or_first: k as u32, ..leaf });
+            next = left;
+        }
+        nodes[next].left_or_first = depth as u32;
+        nodes
+    }
+
+    #[test]
+    fn expanded_capacity_is_bounded_without_large_allocations() {
+        for count in [0, 1, 394_835, MAX_UNITS] {
+            assert!(check_unit_capacity(count).is_ok(), "{count}");
+        }
+        for count in [MAX_UNITS + 1, usize::MAX] {
+            assert!(check_unit_capacity(count).unwrap_err().contains("524288"));
+        }
+        let layout = Layout::new(1, 32, MAX_UNITS);
+        assert_eq!((layout.max_units(), layout.top_cap), (MAX_UNITS, 1_048_575));
+        assert_eq!(check_top(&depth_chain(TOP_DEPTH), |r| r <= TOP_DEPTH as u32).unwrap(), TOP_DEPTH);
+        assert!(check_top(&depth_chain(TOP_DEPTH + 1), |_| true).unwrap_err().contains("deeper"));
+        assert_eq!(check_mesh(&depth_chain(MESH_DEPTH), MESH_DEPTH + 1).unwrap(), MESH_DEPTH);
+        assert!(check_mesh(&depth_chain(MESH_DEPTH + 1), MESH_DEPTH + 2).unwrap_err().contains("deeper"));
+    }
+
+    #[test]
+    fn top_and_mesh_depth_limits_walk_all_64_stack_entries() {
+        let mesh = depth_chain(MESH_DEPTH);
+        let top = depth_chain(TOP_DEPTH);
+        let mut nodes = vec![bvh::EMPTY];
+        nodes.extend_from_slice(&mesh);
+        let top_at = nodes.len() as u32;
+        nodes.extend_from_slice(&top);
+        let mut triangles = vec![[Vec3A::ZERO; 3]; MESH_DEPTH + 2]; // The still leaf, then the mesh.
+        // The deepest left leaf misses; the sibling pushed into the last stack entry must still be visited.
+        triangles[MESH_DEPTH] = [Vec3A::new(-0.5, -0.5, 0.0), Vec3A::new(0.5, -0.5, 0.0), Vec3A::new(0.0, 0.5, 0.0)];
+        let mut tri_verts = vec![];
+        put_tris(&mut tri_verts, &triangles);
+        let instance = crate::scene::Instance { mesh: 0, world: Mat4::IDENTITY, object: 0, cast_shadow: true, name: String::new(), sub: None, hidden: false };
+        let records = vec![unit_record(instance.gpu(1, 0), 1, true); TOP_DEPTH + 1];
+        for mode in [TRACE_CLOSEST, TRACE_SHADOW, TRACE_ANY] {
+            let kernel = Kernel {
+                nodes: &nodes, tri_verts: &tri_verts, instances: &records,
+                top: top_at, units: records.len() as u32, steps: Default::default(), budget: 10_000,
+                deepest: Default::default(), reads: Default::default(),
+            };
+            let hit = kernel.trace(Vec3A::new(0.0, 0.0, -2.0), Vec3A::Z, INF, mode).unwrap();
+            assert_eq!((hit.t, hit.tri, hit.inst), (2.0, MESH_DEPTH as u32, TOP_DEPTH as u32));
+            assert_eq!(kernel.deepest.get(), STACK, "mode {mode}: the last slot must be used");
+        }
+    }
+
+    /// Explicit capacity verification: synthetic boxes only, no model loading or GPU. Kept out of the routine
+    /// suite because it builds and validates up to a million nodes (run with --ignored after memory budgeting).
+    #[test]
+    #[ignore = "large top-tree capacity check; run explicitly after build/memory coordination"]
+    fn expanded_top_tree_builds_394835_and_the_capacity_boundary() {
+        for count in [394_835, MAX_UNITS] {
+            let units: Vec<UnitBox> = (0..count).map(|record| UnitBox { record: record as u32, lo: Vec3A::splat(-1.0), hi: Vec3A::splat(1.0) }).collect();
+            let nodes = top_tree(&units).unwrap();
+            assert_eq!(nodes.len(), 2 * count - 1);
+            assert_eq!(check_top(&nodes, |r| (r as usize) < count).unwrap(), TOP_DEPTH - 1);
+            assert_eq!(nodes.iter().filter(|n| n.count == 1).count(), count);
+        }
     }
 
     /// A deterministic stream of numbers in [0, 1).

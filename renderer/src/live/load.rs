@@ -214,6 +214,9 @@ impl EmitterWorker {
 pub(super) fn load_scene(g: &gpu::Gpu, world: &World, assets: &Path, presets: &Path, w: u32, h: u32, targets: &Targets, passes: &Passes) -> Result<(LoadedScene, crate::desc::PostPreset)> {
     let t0 = Instant::now();
     let mut sc = scene::build(world, assets, presets, None)?;
+    // A browser must report this limit instead of silently flattening every instance into world-space triangles.
+    #[cfg(target_arch = "wasm32")]
+    crate::units::check_unit_capacity(sc.instances.len()).map_err(anyhow::Error::msg)?;
     sc.width = w;
     sc.height = h;
     // Emitters its edits add get a light-tree subtree of their own (ROADMAP § 6 step 4).

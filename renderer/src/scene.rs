@@ -728,15 +728,60 @@ pub(crate) fn file_key(path: &Path) -> String {
     format!("{}|{len}|{mtime}", path.display())
 }
 
-/// Process-wide parse / decode caches (bounded: cleared when they grow past a working set).
+// Process-wide parse / decode caches (bounded: cleared when they grow past a working set).
+static GLTF_CACHE: std::sync::Mutex<Option<HashMap<String, Arc<skin::Model>>>> = std::sync::Mutex::new(None);
+static IMAGE_CACHE: std::sync::Mutex<Option<HashMap<String, Arc<image::RgbaImage>>>> = std::sync::Mutex::new(None);
+
+/// Releases the parse / decode caches' references and backing allocations. Call after the old world and view
+/// have been dropped, with scene loading quiescent: an in-flight load may otherwise populate a cache again.
+/// Native callers keep the same cache behaviour unless they explicitly request this reset.
+pub fn clear_asset_caches() {
+    let gltf = GLTF_CACHE.lock().unwrap().take();
+    let images = IMAGE_CACHE.lock().unwrap().take();
+    drop((gltf, images));
+}
+
+#[cfg(test)]
+mod asset_cache_reset_tests {
+    use super::*;
+
+    #[test]
+    fn asset_cache_reset_releases_and_reloads_the_same_keys() {
+        fn model(name: &str) -> Result<skin::Model> {
+            let json = serde_json::json!({ "asset": { "version": "2.0" }, "scenes": [{ "name": name, "nodes": [] }], "scene": 0 });
+            let gltf = gltf::Gltf::from_slice(json.to_string().as_bytes())?;
+            skin::Model::new((gltf.document, vec![], vec![]))
+        }
+        let gltf_key = "session-reset-gltf-same-path-and-length";
+        let image_key = "session-reset-image-same-path-and-length";
+        let old_model = cached_gltf(gltf_key, || model("before")).unwrap();
+        let old_image = cached_image(image_key, || Ok(image::RgbaImage::from_pixel(1, 1, image::Rgba([255, 0, 0, 255])))).unwrap();
+        let weak_model = Arc::downgrade(&old_model);
+        let weak_image = Arc::downgrade(&old_image);
+        assert!(Arc::ptr_eq(&old_model, &cached_gltf(gltf_key, || panic!("cached model must be reused")).unwrap()));
+        assert!(Arc::ptr_eq(&old_image, &cached_image(image_key, || panic!("cached image must be reused")).unwrap()));
+        drop((old_model, old_image));
+
+        clear_asset_caches();
+        assert!(weak_model.upgrade().is_none(), "reset must release the cached model");
+        assert!(weak_image.upgrade().is_none(), "reset must release the decoded pixels");
+        let fresh_model = cached_gltf(gltf_key, || model("after!")).unwrap();
+        let fresh_image = cached_image(image_key, || Ok(image::RgbaImage::from_pixel(1, 1, image::Rgba([0, 0, 255, 255])))).unwrap();
+        assert_eq!(fresh_model.gltf.0.scenes().next().unwrap().name(), Some("after!"));
+        assert_eq!(fresh_image.get_pixel(0, 0).0, [0, 0, 255, 255]);
+        drop((fresh_model, fresh_image));
+        clear_asset_caches();
+        clear_asset_caches(); // Reset is idempotent.
+    }
+}
+
 fn cached_gltf(key: &str, load: impl FnOnce() -> Result<skin::Model>) -> Result<Arc<skin::Model>> {
-    static CACHE: std::sync::Mutex<Option<HashMap<String, Arc<skin::Model>>>> = std::sync::Mutex::new(None);
     let key = key.to_string();
-    if let Some(g) = CACHE.lock().unwrap().as_ref().and_then(|c| c.get(&key)) {
+    if let Some(g) = GLTF_CACHE.lock().unwrap().as_ref().and_then(|c| c.get(&key)) {
         return Ok(g.clone());
     }
     let g = Arc::new(load()?);
-    let mut c = CACHE.lock().unwrap();
+    let mut c = GLTF_CACHE.lock().unwrap();
     let c = c.get_or_insert_with(HashMap::new);
     if c.len() > 2048 {
         c.clear();
@@ -746,13 +791,12 @@ fn cached_gltf(key: &str, load: impl FnOnce() -> Result<skin::Model>) -> Result<
 }
 
 fn cached_image(key: &str, load: impl FnOnce() -> Result<image::RgbaImage>) -> Result<Arc<image::RgbaImage>> {
-    static CACHE: std::sync::Mutex<Option<HashMap<String, Arc<image::RgbaImage>>>> = std::sync::Mutex::new(None);
     let key = key.to_string();
-    if let Some(i) = CACHE.lock().unwrap().as_ref().and_then(|c| c.get(&key)) {
+    if let Some(i) = IMAGE_CACHE.lock().unwrap().as_ref().and_then(|c| c.get(&key)) {
         return Ok(i.clone());
     }
     let img = Arc::new(load()?);
-    let mut c = CACHE.lock().unwrap();
+    let mut c = IMAGE_CACHE.lock().unwrap();
     let c = c.get_or_insert_with(HashMap::new);
     // Byte budget, not a count: a street scene references ~100 maps and structural edits rebuild the scene.
     let bytes: usize = c.values().map(|i| i.as_raw().len()).sum();

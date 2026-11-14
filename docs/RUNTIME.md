@@ -974,7 +974,7 @@ procedural objects (`trace_procs`: the ray into the object's space, a tree of it
   walk's stack declaration taken out ("The stack"). A scene without units has none of it; hardware traversal's
   kernel never does.
 - Still flattened, as before: meshes that deform (a pose shared by a crowd), every instance of a scene with more
-  of them than a top tree holds (2^18), and every instance of an offline render (`prepare`; a live session's scene
+  of them than a top tree holds (2^19), and every instance of an offline render (`prepare`; a live session's scene
   goes through `prepare_live`), unless `THREERT_UNITS=1`. `THREERT_UNITS=0` flattens everything, as before this
   step (the A/B).
 
@@ -1015,8 +1015,8 @@ cost hello world 0.3 ms a frame, Kabukichō 0.75 and the voxel level 0.55; the s
 1.1 and 1.5 more, **and cost every flattened scene the same** (a kernel without units is the file as it is, so it
 still pays: "Open" in ROADMAP § 6 step 7c). A walk reads only what it pushed, so what an earlier ray left is never
 read. The still walk uses 48 entries, as before, and leaves the stack empty; a unit's walk pushes above what the
-top walk has pending. The top tree is at most 19 deep (a built tree 18, which holds 2^18 units, the most a scene is
-given units for; a root over two of them). That leaves 45 for a mesh tree. Binned SAH is not balanced: measured on
+top walk has pending. The top tree is at most 20 deep (a built tree 19, which holds 2^19 units, the most a scene is
+given units for; a root over two of them). That leaves 44 for a mesh tree. Binned SAH is not balanced: measured on
 the CPU, its trees over the catalog's models are 17 deep for 37 k triangles, 20 for 502 k, 22 for a 31 k-triangle
 building of Kabukichō, and 42 for the 5.86 M triangles of `zero-day` (a balanced tree there is 21), which as part of
 a flattened scene fitted the still walk's 48. A mesh tree deeper than 45 is built again by median splits, whose

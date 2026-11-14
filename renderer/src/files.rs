@@ -18,6 +18,19 @@ pub fn provide(path: &Path, bytes: Vec<u8>) {
     PROVIDED.with(|p| p.borrow_mut().insert(path.to_path_buf(), bytes.into()));
 }
 
+/// Drops every file supplied by the page, including the map's backing allocation. A browser session reset calls
+/// this after dropping the world and its decoded asset caches; a view-only restart keeps these files.
+#[cfg(target_arch = "wasm32")]
+pub fn clear_provided() {
+    drop(PROVIDED.with_borrow_mut(std::mem::take));
+}
+
+/// Counts only supplied file payloads, without disclosing their paths or contents.
+#[cfg(target_arch = "wasm32")]
+pub fn provided_stats() -> (usize, usize) {
+    PROVIDED.with_borrow(|p| (p.len(), p.values().map(|bytes| bytes.len()).sum()))
+}
+
 /// The file's bytes.
 pub fn read(path: &Path) -> std::io::Result<Vec<u8>> {
     #[cfg(not(target_arch = "wasm32"))]
@@ -30,7 +43,7 @@ pub fn read(path: &Path) -> std::io::Result<Vec<u8>> {
 
 /// The file's length and modification time (ns since the epoch), for the caches' keys; (0, 0) for one that is not
 /// there. In a browser: its length (bytes provided anew under a path are another version only if their length differs;
-/// a page that replaces a file reloads).
+/// a page that replaces a file resets the session, including its decoded caches, and supplies its files again).
 pub fn version(path: &Path) -> (u64, u128) {
     #[cfg(not(target_arch = "wasm32"))]
     {

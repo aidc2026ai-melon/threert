@@ -17,7 +17,8 @@
 
 use glam::Vec3;
 use serde_json::{json, Value};
-use std::cell::RefCell;
+use std::cell::{Cell, RefCell};
+use std::collections::HashMap;
 use std::path::Path;
 use threert_render::live::{Camera, LiveCore};
 use threert_render::physics::PhysicsWorld;
@@ -25,6 +26,8 @@ use threert_render::voxel::VoxelWorld;
 use threert_render::world::World;
 use threert_render::{api, files, gpu};
 use wasm_bindgen::prelude::*;
+
+mod lifecycle;
 
 /// What scene code edits through `__engine`: as the native `ScriptHost`'s.
 #[derive(Default)]
@@ -38,6 +41,8 @@ struct Engine {
 struct View {
     core: LiveCore,
     surface: wgpu::Surface<'static>,
+    canvas: web_sys::HtmlCanvasElement,
+    config: wgpu::SurfaceConfiguration,
     blit: wgpu::RenderPipeline,
     blit_bg: wgpu::BindGroup,
     /// The frame script's clock (`f.time`): each frame's dt clamped to [0, 0.1] s, in f64 (script.rs `GameClock`).
@@ -55,9 +60,99 @@ struct View {
     first: (f64, std::sync::Arc<std::sync::atomic::AtomicU64>),
 }
 
+impl Drop for View {
+    fn drop(&mut self) {
+        // An explicit teardown is a normal GPUDevice.lost reason="destroyed", not a rendering failure.
+        self.core.g.device.destroy();
+    }
+}
+
+/// Covers every Result-returning initialization failure after device acquisition, including LiveCore::new.
+struct PendingDevice(Option<wgpu::Device>);
+
+impl Drop for PendingDevice {
+    fn drop(&mut self) {
+        if let Some(device) = self.0.take() {
+            device.destroy();
+        }
+    }
+}
+
+struct PendingStart(u64);
+
+impl Drop for PendingStart {
+    fn drop(&mut self) {
+        SESSION.with_borrow_mut(|s| s.finish(self.0));
+    }
+}
+
 thread_local! {
     static ENGINE: RefCell<Engine> = RefCell::default();
     static VIEW: RefCell<Option<View>> = const { RefCell::new(None) };
+    static SESSION: RefCell<lifecycle::Lifecycle> = RefCell::default();
+    static FRAME_WAITERS: RefCell<HashMap<u64, (js_sys::Function, js_sys::Function)>> = RefCell::default();
+    static NEXT_FRAME_WAITER: Cell<u64> = const { Cell::new(0) };
+}
+
+fn current(generation: u64) -> bool {
+    SESSION.with_borrow(|s| s.is_current(generation))
+}
+
+fn aborted() -> JsValue {
+    let e = js_sys::Error::new("ThreeRT start was cancelled or superseded");
+    e.set_name("AbortError");
+    e.into()
+}
+
+fn drop_view() {
+    // A cancelled host frame must not wait for a slow compile or revive when an old device completes later.
+    let waiting = FRAME_WAITERS.with_borrow_mut(std::mem::take);
+    for (_, (_, reject)) in waiting {
+        let _ = reject.call1(&JsValue::UNDEFINED, &aborted());
+    }
+    // Release the RefCell borrow before destroying the device or dropping its callbacks.
+    let old = VIEW.with_borrow_mut(Option::take);
+    drop(old);
+}
+
+/// Cancels pending starts and explicitly destroys the current GPU view. Scene data and provided assets remain,
+/// so a later start can reuse the world. The JS host must also cancel its RAF loop and detach its event listeners.
+#[wasm_bindgen]
+pub fn dispose() {
+    SESSION.with_borrow_mut(lifecycle::Lifecycle::cancel);
+    drop_view();
+}
+
+/// A new scene session: dispose the view, then release world/physics/voxel data and provided/decoded assets.
+/// Existing JS SceneBindings must be discarded and recreated; their handles and upload caches are no longer valid.
+/// Freed WASM heap allocations become reusable; WebAssembly.Memory itself does not shrink.
+#[wasm_bindgen]
+pub fn reset() {
+    dispose();
+    drop(ENGINE.replace(Engine::default()));
+    files::clear_provided();
+    threert_render::scene::clear_asset_caches();
+    threert_render::procasset::clear_asset_cache();
+    threert_render::clear_environment_cache();
+}
+
+/// Small, content-free diagnostics for a host's teardown/reinitialization checks.
+#[wasm_bindgen(js_name = sessionState)]
+pub fn session_state() -> String {
+    let (generation, pending) = SESSION.with_borrow(lifecycle::Lifecycle::snapshot);
+    let live = VIEW.with_borrow(|v| v.as_ref().map(|v| json!({
+        "width": v.core.w, "height": v.core.h,
+        "surfaceWidth": v.config.width, "surfaceHeight": v.config.height, "frame": v.core.frame,
+    })));
+    let resources = engine(|e| {
+        let (files, bytes) = files::provided_stats();
+        json!({ "objects": e.world.objects.len(), "geometries": e.world.geometries.len(),
+            "materials": e.world.materials.len(), "textures": e.world.textures.len(),
+            "providedFiles": files, "providedBytes": bytes })
+    });
+    let pending_frames = FRAME_WAITERS.with_borrow(HashMap::len);
+    json!({ "generation": generation.to_string(), "pending": pending, "hasView": live.is_some(), "pendingFrameWaits": pending_frames,
+        "view": live, "resources": resources }).to_string()
 }
 
 fn thrown(e: api::Error) -> JsValue {
@@ -328,7 +423,12 @@ fn texel(x: i32, y: i32) -> vec4<f32> {
 
 @fragment fn fs(@builtin(position) p: vec4<f32>) -> @location(0) vec4<f32> {
     let dims = vec2<f32>(W, H);
-    let uv = p.xy / vec2<f32>(SW, SH);
+    // Presentation can resize without reallocating the renderer's output. Preserve its aspect and letterbox;
+    // click() uses the same transform, so the bars never select geometry.
+    let fit = min(SW / W, SH / H);
+    let shown = dims * fit;
+    let uv = (p.xy - (vec2<f32>(SW, SH) - shown) * 0.5) / shown;
+    if any(uv < vec2<f32>(0.0)) || any(uv >= vec2<f32>(1.0)) { return vec4<f32>(0.0, 0.0, 0.0, 1.0); }
     let q = uv * dims - 0.5;
     let f = fract(q);
     let i = vec2<i32>(floor(q));
@@ -354,23 +454,50 @@ pub fn provide(path: &str, bytes: Vec<u8>) {
 /// `width` x `height` (the view's own pixels; the canvas may be larger). `info`: the node host's `describe()`.
 /// `guard`: the loop guard's limit, iterations an invocation (0: 65,536; it cannot be switched off here).
 /// `scale`: the traced resolution's share of the view's, 0 for dynamic resolution toward `fps`. Resolves to what it
-/// opened, as JSON: the adapter, the device's limits that matter here, the times of the load.
+/// opened, as JSON: the adapter, the device's limits that matter here, the times of the load. This synchronous
+/// entry point claims its generation before scheduling the future, so start(); dispose() in one JS task cancels it.
+/// Cancellation is checked at async boundaries; synchronous scene construction cannot be interrupted mid-call.
 #[wasm_bindgen]
-pub async fn start(canvas: web_sys::HtmlCanvasElement, width: u32, height: u32, info: String, scale: f32, fps: u32, guard: u32) -> Result<String, JsValue> {
+pub fn start(canvas: web_sys::HtmlCanvasElement, width: u32, height: u32, info: String, scale: f32, fps: u32, guard: u32) -> js_sys::Promise {
     hook();
-    gpu::set_loop_guard(guard);
+    let info: Value = match serde_json::from_str(&info) {
+        Ok(v) => v,
+        Err(e) => return js_sys::Promise::reject(&failed(e)),
+    };
+    if let Err(e) = lifecycle::validate_output(width, height) {
+        return js_sys::Promise::reject(&js_sys::TypeError::new(e));
+    }
+    if !scale.is_finite() || !info.is_object() {
+        return js_sys::Promise::reject(&js_sys::TypeError::new("start: scale must be finite and info must be an object"));
+    }
+    let generation = SESSION.with_borrow_mut(lifecycle::Lifecycle::begin);
+    // No old/new live targets overlap during a valid restart. World data deliberately survives.
+    drop_view();
+    wasm_bindgen_futures::future_to_promise(async move {
+        let _pending = PendingStart(generation);
+        start_view(canvas, width, height, info, scale, fps, guard, generation).await.map(|s| JsValue::from_str(&s))
+    })
+}
+
+async fn start_view(canvas: web_sys::HtmlCanvasElement, width: u32, height: u32, info: Value, scale: f32, fps: u32, guard: u32, generation: u64) -> Result<String, JsValue> {
+    if !current(generation) { return Err(aborted()); }
     let t0 = js_sys::Date::now();
-    let info: Value = serde_json::from_str(&info).map_err(failed)?;
-    let g = gpu::Gpu::new_async().await.map_err(failed)?;
+    let result = gpu::Gpu::new_async_cancelable(|| !current(generation)).await;
+    if !current(generation) {
+        if let Ok(g) = result { g.device.destroy(); }
+        return Err(aborted());
+    }
+    let g = result.map_err(failed)?;
+    let mut pending_device = PendingDevice(Some(g.device.clone()));
+    // Set this only for the current session, after the awaits that another start can supersede.
+    gpu::set_loop_guard(if guard == 0 { 65_536 } else { guard });
     let t_gpu = js_sys::Date::now();
     let surface = g.instance.create_surface(wgpu::SurfaceTarget::Canvas(canvas.clone())).map_err(failed)?;
     let caps = surface.get_capabilities(&g.adapter);
     // The view's output is sRGB-encoded bytes already: shown through a format that does not encode again.
     let format = caps.formats.iter().copied().find(|f| !f.is_srgb()).ok_or_else(|| failed("the canvas has no format"))?;
     let (sw, sh) = (canvas.width().max(1), canvas.height().max(1));
-    surface.configure(
-        &g.device,
-        &wgpu::SurfaceConfiguration {
+    let config = wgpu::SurfaceConfiguration {
             usage: wgpu::TextureUsages::RENDER_ATTACHMENT,
             format,
             width: sw,
@@ -380,8 +507,11 @@ pub async fn start(canvas: web_sys::HtmlCanvasElement, width: u32, height: u32, 
             alpha_mode: caps.alpha_modes[0],
             view_formats: vec![],
             color_space: Default::default(),
-        },
-    );
+        };
+    if sw > g.device.limits().max_texture_dimension_2d || sh > g.device.limits().max_texture_dimension_2d {
+        return Err(failed("start: canvas exceeds this device's maxTextureDimension2D"));
+    }
+    surface.configure(&g.device, &config);
     let limits = g.device.limits();
     let adapter = g.adapter_info.clone();
     let timestamps = g.timestamps;
@@ -399,7 +529,32 @@ pub async fn start(canvas: web_sys::HtmlCanvasElement, width: u32, height: u32, 
     if scale > 0.0 {
         core.render_scale = scale.clamp(threert_render::live::MIN_SCALE, 1.0);
     }
+    let (blit, blit_bg) = make_blit(&core, format, sw, sh);
+    let out = json!({
+        "adapter": { "name": adapter.name, "vendor": adapter.vendor, "device": adapter.device, "backend": format!("{:?}", adapter.backend), "type": format!("{:?}", adapter.device_type) },
+        "format": format!("{format:?}"),
+        "timestamps": timestamps,
+        "merged": core.g.merged,
+        "loop_guard": gpu::loop_guard(),
+        "limits": { "maxStorageBuffersPerShaderStage": limits.max_storage_buffers_per_shader_stage, "maxBufferSize": limits.max_buffer_size, "maxStorageBufferBindingSize": limits.max_storage_buffer_binding_size },
+        "triangles": core.triangles,
+        "ms": { "gpu": t_gpu - t0, "view": js_sys::Date::now() - t_gpu },
+        "load": core.load_timings().iter().map(|(k, v)| (k.clone(), json!(v))).collect::<serde_json::Map<_, _>>(),
+    });
+    let on = |k: &str| info[k].as_array().is_some_and(|a| !a.is_empty());
+    let scene_cam = core.scene_camera();
+    if !current(generation) { return Err(aborted()); }
+    // From this point View owns device destruction, including any future explicit replacement.
+    pending_device.0.take();
+    let next = View { core, surface, canvas, config, blit, blit_bg, clock: 0.0, has_frame: info["frame"].as_bool().unwrap_or(false), has_on: on("on"), scene_cam, fps: fps.max(1), lockstep: false, first: (0.0, Default::default()) };
+    let old = VIEW.replace(Some(next));
+    drop(old);
+    Ok(out.to_string())
+}
+
+fn make_blit(core: &LiveCore, format: wgpu::TextureFormat, sw: u32, sh: u32) -> (wgpu::RenderPipeline, wgpu::BindGroup) {
     let d = &core.g.device;
+    let (width, height) = (core.w, core.h);
     let module = d.create_shader_module(wgpu::ShaderModuleDescriptor { label: Some("blit"), source: wgpu::ShaderSource::Wgsl(BLIT.into()) });
     let layout = d.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
         label: Some("blit"),
@@ -428,21 +583,55 @@ pub async fn start(canvas: web_sys::HtmlCanvasElement, width: u32, height: u32, 
         cache: None,
     });
     let blit_bg = d.create_bind_group(&wgpu::BindGroupDescriptor { label: Some("blit"), layout: &layout, entries: &[wgpu::BindGroupEntry { binding: 0, resource: core.targets.out.as_entire_binding() }] });
-    let out = json!({
-        "adapter": { "name": adapter.name, "vendor": adapter.vendor, "device": adapter.device, "backend": format!("{:?}", adapter.backend), "type": format!("{:?}", adapter.device_type) },
-        "format": format!("{format:?}"),
-        "timestamps": timestamps,
-        "merged": core.g.merged,
-        "loop_guard": gpu::loop_guard(),
-        "limits": { "maxStorageBuffersPerShaderStage": limits.max_storage_buffers_per_shader_stage, "maxBufferSize": limits.max_buffer_size, "maxStorageBufferBindingSize": limits.max_storage_buffer_binding_size },
-        "triangles": core.triangles,
-        "ms": { "gpu": t_gpu - t0, "view": js_sys::Date::now() - t_gpu },
-        "load": core.load_timings().iter().map(|(k, v)| (k.clone(), json!(v))).collect::<serde_json::Map<_, _>>(),
-    });
-    let on = |k: &str| info[k].as_array().is_some_and(|a| !a.is_empty());
-    let scene_cam = core.scene_camera();
-    VIEW.set(Some(View { core, surface, blit, blit_bg, clock: 0.0, has_frame: info["frame"].as_bool().unwrap_or(false), has_on: on("on"), scene_cam, fps: fps.max(1), lockstep: false, first: (0.0, Default::default()) }));
-    Ok(out.to_string())
+    (blit, blit_bg)
+}
+
+/// Resizes only the presentation surface. The fixed RT output is bilinearly enlarged/letterboxed, so this does not
+/// add detail or resize its storage targets. For a different RT resolution use start() with new width/height.
+#[wasm_bindgen(js_name = resizeSurface)]
+pub fn resize_surface(width: u32, height: u32) -> Result<(), JsValue> {
+    view(|v| {
+        let max = v.core.g.device.limits().max_texture_dimension_2d;
+        if width == 0 || height == 0 || width > max || height > max {
+            return Err(js_sys::TypeError::new("resizeSurface: dimensions must be nonzero and within maxTextureDimension2D").into());
+        }
+        if (width, height) == (v.config.width, v.config.height) && (width, height) == (v.canvas.width(), v.canvas.height()) { return Ok(()); }
+        let (blit, blit_bg) = make_blit(&v.core, v.config.format, width, height);
+        v.canvas.set_width(width);
+        v.canvas.set_height(height);
+        v.config.width = width;
+        v.config.height = height;
+        v.surface.configure(&v.core.g.device, &v.config);
+        v.blit = blit;
+        v.blit_bg = blit_bg;
+        Ok(())
+    })
+}
+
+/// Backpressure for the JS host: await all work submitted before this call before submitting another frame.
+/// Wgpu also invokes its completion callback on queue/device error, so this notification is not a GPU health
+/// assertion: retain the host's device-loss/uncaptured-error checks. Explicit teardown rejects with AbortError.
+#[wasm_bindgen(js_name = waitForFrame)]
+pub fn wait_for_frame() -> js_sys::Promise {
+    let queue = VIEW.with_borrow(|v| v.as_ref().map(|v| v.core.g.queue.clone()));
+    let Some(queue) = queue else {
+        return js_sys::Promise::reject(&failed("no view: `start` has not resolved"));
+    };
+    let generation = SESSION.with_borrow(|s| s.snapshot().0);
+    let id = NEXT_FRAME_WAITER.with(|n| { let id = n.get().wrapping_add(1); n.set(id); id });
+    js_sys::Promise::new(&mut |resolve, reject| {
+        FRAME_WAITERS.with_borrow_mut(|w| w.insert(id, (resolve, reject)));
+        queue.on_submitted_work_done(move || {
+            let callbacks = FRAME_WAITERS.with_borrow_mut(|w| w.remove(&id));
+            if let Some((resolve, reject)) = callbacks {
+                if SESSION.with_borrow(|s| s.snapshot().0) == generation {
+                    let _ = resolve.call0(&JsValue::UNDEFINED);
+                } else {
+                    let _ = reject.call1(&JsValue::UNDEFINED, &aborted());
+                }
+            }
+        });
+    })
 }
 
 fn view<T>(f: impl FnOnce(&mut View) -> Result<T, JsValue>) -> Result<T, JsValue> {
@@ -573,6 +762,7 @@ fn web_time_now() -> f64 {
 #[wasm_bindgen]
 pub fn click(u: f32, v: f32) -> Result<Option<String>, JsValue> {
     view(|view| {
+        let Some((u, v)) = lifecycle::surface_pick(u, v, view.core.w, view.core.h, view.config.width, view.config.height) else { return Ok(None) };
         let Some((target, p, sub)) = view.core.pick(u, v) else { return Ok(None) };
         let r = |x: f32| (x * 1e4).round() / 1e4;
         let (o, d): (Vec3, Vec3) = view.core.ray(u, v);

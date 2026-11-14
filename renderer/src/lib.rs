@@ -41,6 +41,47 @@ use glam::{Vec3, Vec3A};
 use std::path::PathBuf;
 use web_time::Instant;
 
+static ATMOSPHERE_CACHE: std::sync::Mutex<Option<(Vec<u32>, std::sync::Arc<sky::SkyBake>)>> = std::sync::Mutex::new(None);
+static GRADIENT_CACHE: std::sync::Mutex<Option<(sky::Gradient, std::sync::Arc<sky::SkyBake>)>> = std::sync::Mutex::new(None);
+
+/// Drops the last atmosphere and gradient bakes, including a gradient's shared cloud-map image. Browser session
+/// reset calls this after dropping the old world and view; call only while scene preparation is quiescent.
+pub fn clear_environment_cache() {
+    let atmosphere = ATMOSPHERE_CACHE.lock().unwrap().take();
+    let gradient = GRADIENT_CACHE.lock().unwrap().take();
+    drop((atmosphere, gradient));
+}
+
+#[cfg(test)]
+mod environment_cache_reset_tests {
+    use super::*;
+    use std::sync::Arc;
+
+    #[test]
+    fn environment_cache_reset_releases_bakes_and_cloud_pixels() {
+        let bake = || Arc::new(sky::SkyBake { width: 1, height: 1, texels: vec![[0.0; 4]], sun_illuminance: Vec3::ZERO });
+        let atmosphere = bake();
+        let gradient = bake();
+        let cloud = Arc::new(image::RgbaImage::new(1, 1));
+        let (weak_atmosphere, weak_gradient, weak_cloud) = (Arc::downgrade(&atmosphere), Arc::downgrade(&gradient), Arc::downgrade(&cloud));
+        let key = sky::Gradient {
+            zenith: Vec3::ZERO, horizon: Vec3::ZERO, ground: Vec3::ZERO,
+            horizon_exponent: None, glow: None, clouds: None,
+            cloud_map: Some(sky::CloudMap {
+                key: "session-reset-cloud".into(), image: cloud, threshold: [0.0, 1.0], gain: 1.0,
+                offset: Vec3::ZERO, projection: 1.0, bias: 0.0, fade: 1.0,
+            }),
+        };
+        *ATMOSPHERE_CACHE.lock().unwrap() = Some((vec![u32::MAX], atmosphere));
+        *GRADIENT_CACHE.lock().unwrap() = Some((key, gradient));
+        clear_environment_cache();
+        assert!(weak_atmosphere.upgrade().is_none(), "reset must release the atmosphere bake");
+        assert!(weak_gradient.upgrade().is_none(), "reset must release the gradient bake");
+        assert!(weak_cloud.upgrade().is_none(), "the cached gradient key must not retain its cloud image");
+        clear_environment_cache();
+    }
+}
+
 /// `presets/` next to (an ancestor of) the executable, else ./presets.
 pub fn default_presets_dir() -> PathBuf {
     let exe = std::env::current_exe().unwrap_or_default();
@@ -629,11 +670,10 @@ pub fn prepare_as(hwrt: bool, units: bool, sc: &mut scene::Scene, timings: &mut 
     let (env, sky_color, has_env) = match &sc.sky {
         scene::SkyData::Atmosphere { sun_dir, sun_lux, rayleigh, mie, g: mie_g, ground, sun_node, dynamic, glow } => {
             // Scene edits that leave the sky inputs unchanged (materials, transforms, lights) reuse the last bake.
-            static LAST: std::sync::Mutex<Option<(Vec<u32>, std::sync::Arc<sky::SkyBake>)>> = std::sync::Mutex::new(None);
             let alt = sc.camera.position.y.max(0.0);
             let (bw, bh) = if *dynamic { sky::DYNAMIC_SKY } else { (1024, 512) };
             let key: Vec<u32> = [*rayleigh, *mie, *mie_g, ground.x, ground.y, ground.z, sun_dir.x, sun_dir.y, sun_dir.z, sun_lux.x, sun_lux.y, sun_lux.z, alt, glow.uniform.x, glow.uniform.y, glow.uniform.z, glow.horizon.x, glow.horizon.y, glow.horizon.z, glow.height, bw as f32, sc.cloud_cover].iter().map(|f| f.to_bits()).collect();
-            let mut last = LAST.lock().unwrap();
+            let mut last = ATMOSPHERE_CACHE.lock().unwrap();
             let bake = match last.as_ref() {
                 Some((k, b)) if *k == key => b.clone(),
                 _ => {
@@ -655,8 +695,7 @@ pub fn prepare_as(hwrt: bool, units: bool, sc: &mut scene::Scene, timings: &mut 
             (gpu::EnvMap { width: bake.width, height: bake.height, texels: bake.texels.clone() }, Vec3::ZERO, true)
         }
         scene::SkyData::Gradient(gr) => {
-            static LAST: std::sync::Mutex<Option<(sky::Gradient, std::sync::Arc<sky::SkyBake>)>> = std::sync::Mutex::new(None);
-            let mut last = LAST.lock().unwrap();
+            let mut last = GRADIENT_CACHE.lock().unwrap();
             let bake = match last.as_ref() {
                 Some((k, b)) if k == gr => b.clone(),
                 _ => {

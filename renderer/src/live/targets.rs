@@ -123,13 +123,35 @@ pub struct Targets {
 
 impl Targets {
     /// For a view of `w` x `h` and a radiance cache of `cache` entries.
-    pub(super) fn new(g: &gpu::Gpu, w: u32, h: u32, lut: &[u16], cache: u64) -> Targets {
+    pub(super) fn new(g: &gpu::Gpu, w: u32, h: u32, lut: &[u16], cache: u64) -> Result<Targets> {
         let d = &g.device;
         let n = (w * h) as u64;
         let sb = |label: &str, bytes: u64| d.create_buffer(&wgpu::BufferDescriptor { label: Some(label), size: bytes, usage: wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_SRC, mapped_at_creation: false });
         let quarter = (w.div_ceil(4) * h.div_ceil(4)) as u64;
         let texels = |j: u32| bloom_dim(w, h, j).0 as u64 * bloom_dim(w, h, j).1 as u64;
         let bloom_texels = (0..5).map(texels).sum::<u64>() + (0..6).map(|k| texels(bloom_stage_level(k))).sum::<u64>();
+        let limits = d.limits();
+        for b in layout::BINDINGS {
+            let layout::Res::Own(count) = layout::resource(b) else { continue };
+            let layout::Kind::Storage { stride, len, .. } = b.kind else { unreachable!("layout::check") };
+            let count = match count {
+                layout::Count::Pixels(k) => k * n,
+                layout::Count::Quarter => quarter,
+                layout::Count::Bloom => bloom_texels,
+                layout::Count::Declared => len,
+            };
+            gpu::check_storage_binding(&limits, b.name, count * stride)?;
+        }
+        gpu::check_storage_binding(&limits, "accum", n * 80)?;
+        let kernel_bytes = [cache * 4, cache * 32, cache * 32, n * 32, n * 16, (n + layout::light_lists(w, h).1 as u64) * 16];
+        if g.merged {
+            let caps = std::array::from_fn(|k| crate::merged::live_cap(k, kernel_bytes[k]));
+            gpu::check_storage_binding(&limits, "merged live", crate::merged::live_layout(&caps).1)?;
+        } else {
+            for (k, bytes) in kernel_bytes.into_iter().enumerate() {
+                gpu::check_storage_binding(&limits, crate::merged::KERNEL_LIVE[k].name, bytes)?;
+            }
+        }
         let lut_tex = d.create_texture(&wgpu::TextureDescriptor {
             label: Some("tonemap lut"),
             size: wgpu::Extent3d { width: LUT, height: LUT, depth_or_array_layers: LUT },
@@ -162,7 +184,7 @@ impl Targets {
             })
             .collect();
         let out = bufs.iter().find(|b| b.0 == layout::binding("out_px").binding).expect("out_px").1.buffer.clone();
-        Targets {
+        Ok(Targets {
             params: d.create_buffer(&wgpu::BufferDescriptor { label: Some("live params"), size: std::mem::size_of::<LiveParams>() as u64, usage: wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST, mapped_at_creation: false }),
             bufs,
             out,
@@ -171,7 +193,7 @@ impl Targets {
             lut_view: lut_tex.create_view(&Default::default()),
             lut_tex,
             sampler: d.create_sampler(&wgpu::SamplerDescriptor { mag_filter: wgpu::FilterMode::Linear, min_filter: wgpu::FilterMode::Linear, ..Default::default() }),
-        }
+        })
     }
 
     /// The buffer live.wgsl binds as `name` (the passes' own, or the kernel's).

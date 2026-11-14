@@ -157,17 +157,25 @@ impl ProcBlob {
     }
 }
 
+static ASSET_CACHE: std::sync::Mutex<Option<std::collections::HashMap<String, Arc<ProcBlob>>>> = std::sync::Mutex::new(None);
+
+/// Releases parsed procedural assets retained between scene builds. Call with scene loading quiescent, after
+/// dropping the old world and view, to release their shared blobs too.
+pub fn clear_asset_cache() {
+    let assets = ASSET_CACHE.lock().unwrap().take();
+    drop(assets);
+}
+
 /// An asset file under the asset root (the path already checked by the world), parsed once per file version.
 pub fn load(uri: &str, assets: &Path) -> Result<Arc<ProcBlob>> {
-    static CACHE: std::sync::Mutex<Option<std::collections::HashMap<String, Arc<ProcBlob>>>> = std::sync::Mutex::new(None);
     let path = assets.join(uri);
     let key = crate::scene::file_key(&path);
-    if let Some(b) = CACHE.lock().unwrap().as_ref().and_then(|c| c.get(&key)) {
+    if let Some(b) = ASSET_CACHE.lock().unwrap().as_ref().and_then(|c| c.get(&key)) {
         return Ok(b.clone());
     }
     let bytes = crate::files::read(&path).map_err(|e| anyhow!("procedural geometry {uri}: {e}"))?;
     let b = Arc::new(ProcBlob::parse(&bytes).map_err(|e| anyhow!("procedural geometry {uri}: {e}"))?);
-    let mut c = CACHE.lock().unwrap();
+    let mut c = ASSET_CACHE.lock().unwrap();
     let c = c.get_or_insert_with(std::collections::HashMap::new);
     if c.len() > 256 {
         c.clear();
@@ -182,6 +190,17 @@ mod tests {
 
     fn sample() -> ProcBlob {
         ProcBlob::new(vec![0.0, 0.0, 0.0, 1.0, 2.0, 3.0, -1.0, -1.0, -1.0, 0.0, 0.0, 0.0], vec![0xffff_ffff, 0x7fc0_0001, 0, 1]).unwrap()
+    }
+
+    #[test]
+    fn asset_cache_reset_releases_blobs_and_their_bvh() {
+        let blob = Arc::new(sample());
+        let weak = Arc::downgrade(&blob);
+        let _ = blob.sw_bvh();
+        ASSET_CACHE.lock().unwrap().get_or_insert_with(Default::default).insert("session-reset-procedural".into(), blob);
+        clear_asset_cache();
+        assert!(weak.upgrade().is_none(), "reset must drop the cached blob and its lazy BVH");
+        clear_asset_cache();
     }
 
     #[test]

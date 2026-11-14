@@ -19,7 +19,7 @@
 // own 64 words cost hello 0.3 ms a frame and the city 0.75, and the still walk's 48 cost every scene as much again,
 // flattened ones too. This one is set to zero once. A walk reads only what it has pushed: what an earlier ray left
 // is never read. The still walk has left it empty; a unit's walk pushes above what the top walk has pending and is
-// done when it is back down to it. 64 entries: 19 for the top tree, 45 for a mesh's (units.rs `STACK`); the still
+// done when it is back down to it. 64 entries: 20 for the top tree, 44 for a mesh's (units.rs `STACK`); the still
 // walk uses 48 of them, as before. Every index read here was checked on the CPU when it was written (units.rs
 // `check_mesh`, `check_top`), the depths with them.
 //

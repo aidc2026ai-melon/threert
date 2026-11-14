@@ -1086,6 +1086,65 @@ pub fn tlas_rows(w: glam::Mat4) -> [f32; 12] {
 /// Entries of the live radiance cache (pathtrace.wgsl CACHE_SIZE).
 pub const CACHE_SIZE: u64 = 1 << 18;
 
+/// Refuse an oversized storage binding before WebGPU validation can panic the wasm module. This is a device
+/// binding/allocation limit, not a total-memory budget or a prediction of available VRAM.
+pub(crate) fn check_storage_binding(limits: &wgpu::Limits, label: &str, bytes: u64) -> Result<()> {
+    let limit = (limits.max_storage_buffer_binding_size as u64).min(limits.max_buffer_size);
+    if bytes > limit {
+        return Err(anyhow!("{label}: {bytes} bytes exceed this device's storage-buffer limit ({limit} bytes)"));
+    }
+    Ok(())
+}
+
+fn upload_buffer_bytes(bytes: usize, extra: usize) -> u64 {
+    if extra == 0 { bytes.max(512) as u64 } else { (bytes as u64 + extra as u64).next_multiple_of(4) }
+}
+
+fn merged_table_bytes(bytes: [u64; 7]) -> ([u32; 7], u64) {
+    let caps = std::array::from_fn(|k| crate::merged::table_cap(k, bytes[k]));
+    (caps, crate::merged::offsets(&crate::merged::TABLES, &caps).1)
+}
+
+#[cfg(test)]
+mod web_storage_limits_tests {
+    use super::*;
+
+    #[test]
+    fn runtime_binding_limit_checks_both_device_limits() {
+        let mut limits = wgpu::Limits::default();
+        limits.max_storage_buffer_binding_size = 128 << 20;
+        limits.max_buffer_size = 256 << 20;
+        assert!(check_storage_binding(&limits, "fixture", 128 << 20).is_ok());
+        assert!(check_storage_binding(&limits, "fixture", (128 << 20) + 1).is_err());
+        limits.max_buffer_size = 64 << 20;
+        assert!(check_storage_binding(&limits, "fixture", (64 << 20) + 1).is_err());
+    }
+
+    #[test]
+    fn instance_capacity_includes_edit_reserve_and_merged_power_of_two_rounding() {
+        let mut limits = wgpu::Limits::default();
+        limits.max_storage_buffer_binding_size = 128 << 20;
+        limits.max_buffer_size = 256 << 20;
+        let table_size = |instances: usize| {
+            let reserve = instances / 4;
+            merged_table_bytes([
+                512, 512, 512, 32,
+                upload_buffer_bytes(instances * 4 * 16, reserve * 4 * 16),
+                upload_buffer_bytes(instances * 160, reserve * 160),
+                512,
+            ])
+        };
+        let (caps, size) = table_size(394_835);
+        assert_eq!(caps[5], 524_288);
+        assert_eq!(caps[4], 2_097_152);
+        assert_eq!(size, 117_488_128);
+        assert!(check_storage_binding(&limits, "merged fixture", size).is_ok());
+        let (caps, size) = table_size(524_288);
+        assert_eq!(caps[5], 1_048_576);
+        assert!(check_storage_binding(&limits, "merged fixture", size).is_err());
+    }
+}
+
 /// A buffer, or a range of one: in the merged layout (merged.rs) several of the engine's buffers are ranges of the one
 /// buffer a binding holds.
 #[derive(Clone)]
@@ -1509,6 +1568,19 @@ impl Gpu {
 
     /// `new_async`, with a host's own options instead of the environment's.
     pub async fn new_async_with(options: GpuOptions) -> Result<Gpu> {
+        Self::new_async_with_cancel(options, || false).await
+    }
+
+    /// A browser session can be disposed while an adapter/device promise is pending. Check before requesting
+    /// another resource and destroy a device returned after cancellation, before making any of its buffers.
+    pub async fn new_async_cancelable(cancelled: impl Fn() -> bool) -> Result<Gpu> {
+        Self::new_async_with_cancel(GpuOptions::from_env(), cancelled).await
+    }
+
+    async fn new_async_with_cancel(options: GpuOptions, cancelled: impl Fn() -> bool) -> Result<Gpu> {
+        if cancelled() {
+            return Err(anyhow!("GPU initialization cancelled"));
+        }
         let backends = wgpu::Backends::from_env().unwrap_or(wgpu::Backends::PRIMARY);
         let mut desc = wgpu::InstanceDescriptor::new_without_display_handle();
         desc.backends = backends;
@@ -1517,6 +1589,9 @@ impl Gpu {
             .request_adapter(&wgpu::RequestAdapterOptions { power_preference: wgpu::PowerPreference::HighPerformance, force_fallback_adapter: false, compatible_surface: None, ..Default::default() })
             .await
             .map_err(|e| anyhow!("no GPU adapter: {e}"))?;
+        if cancelled() {
+            return Err(anyhow!("GPU initialization cancelled"));
+        }
         let adapter_info = adapter.get_info();
         let al = adapter.limits();
         // The defaults, lowered where the adapter cannot meet them (the iOS Simulator's GPU allows 15 inter-stage
@@ -1555,6 +1630,10 @@ impl Gpu {
             experimental_features: if hwrt { unsafe { wgpu::ExperimentalFeatures::enabled() } } else { wgpu::ExperimentalFeatures::disabled() },
             ..Default::default()
         }).await?;
+        if cancelled() {
+            device.destroy();
+            return Err(anyhow!("GPU initialization cancelled"));
+        }
         let pipeline_cache = cache_feature.and_then(|_| crate::pipeline_cache::PipelineCache::open(&device, options.pipeline_cache.as_ref()?, &adapter_info));
         let uniform_tables = options.uniform_tables_on(merged, cfg!(target_os = "android"));
         let switches = options.kernel;
@@ -1923,6 +2002,38 @@ impl Gpu {
         // (Software traversal's units have room as hardware traversal's instances do: `prepare` sized their trees'
         // by the same figures.)
         let room = EditRoom::for_scene(scene, tri_verts.len() / 3, records.len(), self.hwrt, scene.units.is_some());
+        let grouped_lights = crate::lights_with_groups(&scene.lights);
+        // In particular, increasing the software TLAS capacity must not turn a valid CPU scene into an oversized
+        // merged WebGPU binding. Match buf/buf_room and texture_pages' sizes, including edit reserve and power-of-two
+        // shader table capacities, before allocating any of this scene's buffers.
+        let limits = d.limits();
+        let table_bytes = [
+            upload_buffer_bytes(std::mem::size_of_val(&scene.materials[..]), 0),
+            upload_buffer_bytes(std::mem::size_of_val(&grouped_lights[..]), 0),
+            upload_buffer_bytes(std::mem::size_of_val(emitters), 0),
+            scene.textures.len().max(1) as u64 * 32,
+            upload_buffer_bytes(std::mem::size_of_val(&scene.objects[..]), room.objects * scene.object_stride() * 16),
+            upload_buffer_bytes(records.len().max(1) * std::mem::size_of::<crate::scene::GpuInstance>(), room.records * std::mem::size_of::<crate::scene::GpuInstance>()),
+            upload_buffer_bytes(std::mem::size_of_val(&scene.media[..]), 0),
+        ];
+        for (k, bytes) in table_bytes.into_iter().enumerate() {
+            check_storage_binding(&limits, crate::merged::TABLES[k].name, bytes)?;
+        }
+        if self.merged {
+            let (_, bytes) = merged_table_bytes(table_bytes);
+            check_storage_binding(&limits, "merged scene tables", bytes)?;
+            timings.push(("merged_tables_bytes".into(), bytes as f64));
+        }
+        for (label, bytes) in [
+            ("verts", upload_buffer_bytes(std::mem::size_of_val(tri_verts), room.tris * 48)),
+            ("attrs", upload_buffer_bytes(std::mem::size_of_val(&scene.attrs[..]), room.tris * std::mem::size_of::<crate::scene::GpuTriAttr>())),
+            ("nodes", upload_buffer_bytes(nodes.len(), 0)),
+            ("accum", w as u64 * h as u64 * 80),
+        ] {
+            check_storage_binding(&limits, label, bytes)?;
+        }
+        timings.push(("instance_records_bytes".into(), table_bytes[5] as f64));
+        timings.push(("object_records_bytes".into(), table_bytes[4] as f64));
         let st = wgpu::BufferUsages::STORAGE;
         // (COPY_SRC: the live view's in-place edits grow these past their room by a copy, live/edits.rs `edit_geometry`.)
         let edit = st | wgpu::BufferUsages::COPY_DST | wgpu::BufferUsages::COPY_SRC;
@@ -1948,7 +2059,7 @@ impl Gpu {
         // (ROADMAP § 6 step 2's table: a meshed representation against voxel data).
         timings.push(("tri_data_mb".into(), (std::mem::size_of_val(tri_verts) + std::mem::size_of_val(&scene.attrs[..]) + nodes.len()) as f64 / (1 << 20) as f64));
         let b_mats = buf("materials", bytemuck::cast_slice(&scene.materials), edit);
-        let b_lights = buf("lights", bytemuck::cast_slice(&crate::lights_with_groups(&scene.lights)), edit);
+        let b_lights = buf("lights", bytemuck::cast_slice(&grouped_lights), edit);
         let b_emit = buf("emitters", bytemuck::cast_slice(emitters), edit);
         let (b_cdf, region_words, proc_room) = match &scene.proc_layout {
             None => (buf("env_cdf", bytemuck::cast_slice(env_cdf), st | wgpu::BufferUsages::COPY_DST | wgpu::BufferUsages::COPY_SRC), 0, 0),
@@ -3023,8 +3134,7 @@ impl Gpu {
     /// The buffer of the merged layout's `MergedTables` for these seven tables (merged.rs `TABLES`' order), and its
     /// arrays' lengths.
     fn tables_buffer(&self, tables: [&wgpu::Buffer; 7]) -> (wgpu::Buffer, [u32; 7]) {
-        let caps: [u32; 7] = std::array::from_fn(|k| crate::merged::table_cap(k, tables[k].size()));
-        let (_, size) = crate::merged::offsets(&crate::merged::TABLES, &caps);
+        let (caps, size) = merged_table_bytes(std::array::from_fn(|k| tables[k].size()));
         (self.device.create_buffer(&wgpu::BufferDescriptor { label: Some("merged tables"), size, usage: wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_DST, mapped_at_creation: false }), caps)
     }
 
