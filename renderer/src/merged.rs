@@ -201,6 +201,34 @@ mod tests {
         }
     }
 
+    /// The cache's hash mask and resolve bound must match its actual storage, including the one-entry dummy
+    /// used with the cache off. A mobile allocation must never retain the desktop shader's larger bound.
+    #[test]
+    fn radiance_cache_profiles_match_shader_bounds_and_storage() {
+        for entries in [1u32, 65_536, 262_144] {
+            let mut caps = caps();
+            caps.live[..3].copy_from_slice(&[entries, entries * 8, entries * 2]);
+            let (m, _) = parse(&variant(0, Some(&caps)));
+            let (_, cache_size) = m.constants.iter().find(|(_, k)| k.name.as_deref() == Some("CACHE_SIZE")).expect("CACHE_SIZE");
+            assert_eq!(m.global_expressions[cache_size.init], naga::Expression::Literal(naga::Literal::U32(entries)), "{entries} cache entries");
+            assert!(entries.is_power_of_two(), "the cache hash uses a mask");
+            let (at, size) = layout(&m, "MergedLive");
+            assert_eq!((at.clone(), size), live_layout(&caps.live));
+            assert_eq!(at[..3], [0, u64::from(entries) * 4, (u64::from(entries) * 36).next_multiple_of(16)]);
+            assert_eq!(at[3], (u64::from(entries) * 68).next_multiple_of(256), "all three cache arrays fit before reflection data");
+            let resolve = m.entry_points.iter().find(|p| p.name == "cache_resolve").expect("cache_resolve");
+            assert_eq!(resolve.workgroup_size, [256, 1, 1], "frame dispatch uses groups of 256 entries");
+        }
+    }
+
+    #[test]
+    fn native_radiance_cache_keeps_the_desktop_bound() {
+        let (m, _) = parse(&variant(0, None));
+        let (_, cache_size) = m.constants.iter().find(|(_, k)| k.name.as_deref() == Some("CACHE_SIZE")).expect("CACHE_SIZE");
+        assert_eq!(m.global_expressions[cache_size.init], naga::Expression::Literal(naga::Literal::U32(crate::gpu::CACHE_SIZE as u32)));
+        assert_eq!(crate::gpu::CACHE_SIZE, 262_144);
+    }
+
     /// Every kernel variant with the uniform tables: valid WGSL; the four tables are uniform buffers at their own
     /// bindings, sized as the Rust side makes their buffers; the other fifteen storage buffers are as written; and
     /// each of the four is indexed once, in its accessor, held to its array, so nothing is read outside a uniform

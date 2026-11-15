@@ -181,6 +181,10 @@ pub(super) struct RadianceCache {
     pub(super) resolve: wgpu::ComputePipeline,
 }
 
+fn cache_resolve_workgroups(key_bytes: u64) -> u32 {
+    (key_bytes / 4).div_ceil(256) as u32
+}
+
 /// Share of the pixels showing translucent particles whose nearest hit trains the volume voxels (up to
 /// gpu::VOLUME_TRAIN_CAP points per frame).
 pub(super) const VOLUME_TRAIN_SHARE: f32 = 1.0 / 8.0;
@@ -563,7 +567,7 @@ impl LiveCore {
             pass.set_pipeline(&c.resolve);
             pass.set_bind_group(0, &self.sc.up.bg, &[]);
             pass.set_bind_group(1, &self.kernel_bg, &[]);
-            pass.dispatch_workgroups((gpu::CACHE_SIZE / 256) as u32, 1, 1);
+            pass.dispatch_workgroups(cache_resolve_workgroups(c.bufs.keys.size), 1, 1);
         }
         if let Some(p) = &self.profile {
             // One compute pass per stage, each timed.
@@ -682,4 +686,16 @@ impl LiveCore {
         self.frame = self.frame.wrapping_add(1);
     }
 
+}
+
+#[cfg(test)]
+mod resource_profile_tests {
+    use super::cache_resolve_workgroups;
+
+    #[test]
+    fn cache_resolve_dispatch_matches_the_allocated_key_count() {
+        for (entries, groups) in [(1, 1), (256, 1), (257, 2), (65_536, 256), (262_144, 1024)] {
+            assert_eq!(cache_resolve_workgroups(entries * 4), groups, "{entries} cache entries");
+        }
+    }
 }

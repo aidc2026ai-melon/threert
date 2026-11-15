@@ -516,7 +516,7 @@ impl LiveCore {
         // The scene's post preset replaces this LUT below (apply_post).
         let cache_on = !std::env::var("THREERT_CACHE").is_ok_and(|v| v == "0");
         // (Without the cache the kernel binds one of one entry.)
-        let targets = Targets::new(&g, w, h, &vec![0u16; (LUT * LUT * LUT * 4) as usize], if cache_on { gpu::CACHE_SIZE } else { 1 })?;
+        let targets = Targets::new(&g, w, h, &vec![0u16; (LUT * LUT * LUT * 4) as usize], if cache_on { crate::resource_profile::current().cache_entries() } else { 1 })?;
         let (sc, pp) = load_scene(&g, world, assets, presets, w, h, &targets, &passes)?;
         let cam = sc.scene_camera;
         let (triangles, scene_name) = (sc.triangles, sc.name.clone());

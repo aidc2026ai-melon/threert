@@ -11,6 +11,24 @@ and the WebGPU view. Stop the page's loop/listeners before tearing down or reset
 | `resizeSurface(width, height): void` | Changes the canvas backing size and its presentation configuration/pipeline. Keeps the RT output dimensions and storage targets fixed, bilinearly enlarging with aspect-preserving letterbox bars. This does not add rendered detail. |
 | `waitForFrame(): Promise<void>` | Waits for queue completion notification for work submitted before the call. Await this after `frameEnd()` before submitting another frame to bound in-flight work, including the initial shader compilation. Teardown rejects pending waits with `AbortError`. |
 | `sessionState(): string` | JSON with generation, pending, hasView, output/surface dimensions, frame and content-free world/file counts. |
+| `configureResourceProfile('mobile' \| 'desktop'): string` | Selects allocation reservations with no live view or pending start; otherwise throws. Returns JSON with name, cacheEntries, editReserveScale and maxOutputPixels. `dispose()` preserves this choice; `reset()` returns to desktop. |
+
+## Mobile resource reservations
+
+Use `reset(); configureResourceProfile('mobile');` before uploading the scene and calling `start()`.
+The mobile profile uses 65,536 radiance-cache entries (4.25 MiB for the three cache arrays, versus desktop's
+262,144 entries / 17 MiB), reserves no additional instance/object/triangle space for future edits, and rejects
+output above 65,536 pixels. For example, 320 x 180 is accepted; 640 x 360 is rejected without changing an existing
+view or pending start. There is no automatic geometry omission, instance reduction or output rescaling.
+The full scene must still pass the existing geometry/BVH/adapter binding limits. Existing camera/transform edits
+are supported; a structural addition that needs reserved space can require a scene rebuild.
+
+The smaller cache can increase hash collisions, noise or tracing work. Output/history storage, scene geometry,
+WASM/CPU copies, shader compilation and the host's other renderer still consume memory. This is not a device-memory
+guarantee. Hosts must bound in-flight frames and verify actual target-device behavior independently.
+The profile's settings are included in both `sessionState().resourceProfile` and the resolved `start()` JSON.
+Native execution remains on desktop defaults, retaining `THREERT_CACHE` and `THREERT_EDIT_RESERVE` behavior.
+The new mobile package is built separately; hosts can retain the previous desktop package unchanged.
 
 `start(); dispose()` and `start(); reset()` in the same JavaScript task cancel correctly: the generation is acquired
 before the future's first poll. Superseded/cancelled promises reject with an Error whose `name` is `AbortError`.

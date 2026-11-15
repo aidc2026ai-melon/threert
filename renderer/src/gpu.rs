@@ -137,7 +137,7 @@ pub struct EditRoom {
 
 impl EditRoom {
     fn reserve() -> f64 {
-        std::env::var("THREERT_EDIT_RESERVE").ok().and_then(|v| v.parse().ok()).unwrap_or(1.0)
+        crate::resource_profile::current().edit_reserve_scale()
     }
 
     /// Whether the scene gets room (`for_scene`): editable geometry under hardware RT, or under software traversal
@@ -1084,7 +1084,7 @@ pub fn tlas_rows(w: glam::Mat4) -> [f32; 12] {
 }
 
 /// Entries of the live radiance cache (pathtrace.wgsl CACHE_SIZE).
-pub const CACHE_SIZE: u64 = 1 << 18;
+pub const CACHE_SIZE: u64 = crate::resource_profile::DESKTOP_CACHE_ENTRIES;
 
 /// Refuse an oversized storage binding before WebGPU validation can panic the wasm module. This is a device
 /// binding/allocation limit, not a total-memory budget or a prediction of available VRAM.

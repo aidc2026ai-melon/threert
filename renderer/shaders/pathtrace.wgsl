@@ -2828,7 +2828,13 @@ fn oct_enc(n: vec3<f32>) -> u32 {
 // bounce); each vertex's estimate is added. Sums are fixed point with stochastic rounding (`cache_acc`);
 // `cache_resolve` folds them into `cache_val` once per frame.
 
-const CACHE_SIZE: u32 = 262144u;     // entries, a power of two (gpu.rs CACHE_SIZE)
+// The browser's resource profile may allocate fewer entries. Hashing and resolving must use the same count as
+// its merged key array. The native layout keeps its existing allocation (gpu.rs CACHE_SIZE).
+@if(merged) {
+    const CACHE_SIZE: u32 = ML_CACHE_KEYS;
+} @else {
+    const CACHE_SIZE: u32 = 262144u;
+}
 const CACHE_PROBE: u32 = 8u;         // linear probing window
 const CACHE_ANGLE: f32 = 0.02;       // voxel size / distance to the camera
 const CACHE_MIN_VOXEL: f32 = 0.0625; // m

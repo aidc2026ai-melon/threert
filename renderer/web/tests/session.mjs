@@ -90,3 +90,49 @@ test('frame and resize after dispose are explicit errors, not use-after-free', a
   wasm.reset();
   assert.equal(state().pending, false);
 });
+
+test('mobile reservations are explicit, preserve uploads, and reset restores desktop', () => {
+  wasm.reset();
+  assert.deepEqual(state().resourceProfile, { name: 'desktop', cacheEntries: 262144, editReserveScale: 1, maxOutputPixels: null });
+  wasm.provide('profile-fixture.bin', new Uint8Array([3, 1, 4]));
+  const before = state().resources;
+  const mobile = JSON.parse(wasm.configureResourceProfile('mobile'));
+  assert.deepEqual(mobile, { name: 'mobile', cacheEntries: 65536, editReserveScale: 0, maxOutputPixels: 65536 });
+  assert.deepEqual(state().resources, before, 'choosing reservations must not remove scene resources');
+  assert.throws(() => wasm.configureResourceProfile('Mobile'), /desktop.*mobile/);
+  assert.deepEqual(state().resourceProfile, mobile);
+  wasm.dispose();
+  assert.deepEqual(state().resourceProfile, mobile, 'view-only disposal preserves the chosen profile');
+  wasm.configureResourceProfile('desktop');
+  assert.equal(state().resourceProfile.cacheEntries, 262144);
+  wasm.configureResourceProfile('mobile');
+  wasm.reset();
+  assert.equal(state().resourceProfile.name, 'desktop');
+  assert.equal(state().resources.providedBytes, 0);
+});
+
+test('pending start locks its resource profile until cancelled', async () => {
+  wasm.reset();
+  wasm.configureResourceProfile('mobile');
+  const p = start();
+  assert.throws(() => wasm.configureResourceProfile('desktop'), /dispose/);
+  assert.equal(state().pending, true);
+  assert.equal(state().resourceProfile.name, 'mobile');
+  wasm.dispose();
+  wasm.configureResourceProfile('desktop');
+  await cancelled(p);
+  assert.equal(state().resourceProfile.name, 'desktop');
+});
+
+test('mobile output cap rejects before cancelling a valid pending start', async () => {
+  wasm.reset();
+  wasm.configureResourceProfile('mobile');
+  const p = start(), before = state().generation;
+  const bad = wasm.start(canvas, 640, 360, '{}', 1, 30, 65536);
+  assert.equal(state().generation, before);
+  assert.equal(state().pending, true);
+  wasm.reset();
+  await assert.rejects(bad, /65536 pixels/);
+  await cancelled(p);
+  assert.equal(state().resourceProfile.name, 'desktop');
+});

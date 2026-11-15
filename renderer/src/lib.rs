@@ -19,6 +19,7 @@ pub mod ltree;
 pub mod merged;
 pub mod post;
 pub mod procasset;
+pub mod resource_profile;
 pub mod scene;
 #[cfg(not(target_arch = "wasm32"))]
 pub mod script;

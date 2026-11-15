@@ -129,11 +129,33 @@ pub fn dispose() {
 #[wasm_bindgen]
 pub fn reset() {
     dispose();
+    let _ = threert_render::resource_profile::set_browser_profile(threert_render::resource_profile::ResourceProfile::Desktop);
     drop(ENGINE.replace(Engine::default()));
     files::clear_provided();
     threert_render::scene::clear_asset_caches();
     threert_render::procasset::clear_asset_cache();
     threert_render::clear_environment_cache();
+}
+
+fn resource_profile_json() -> Value {
+    let profile = threert_render::resource_profile::current();
+    json!({ "name": profile.name(), "cacheEntries": profile.cache_entries(),
+        "editReserveScale": profile.edit_reserve_scale(), "maxOutputPixels": profile.max_output_pixels() })
+}
+
+/// Select reservations before start; this does not remove scene objects or alter their geometry.
+/// A live/pending view must be disposed first. dispose preserves the choice; reset restores desktop.
+/// Native builds keep their original defaults and environment-variable controls.
+#[wasm_bindgen(js_name = configureResourceProfile)]
+pub fn configure_resource_profile(name: &str) -> Result<String, JsValue> {
+    let profile = threert_render::resource_profile::ResourceProfile::parse(name).map_err(|e| js_sys::TypeError::new(e))?;
+    let pending = SESSION.with_borrow(|s| s.snapshot().1);
+    let live = VIEW.with_borrow(|v| v.is_some());
+    if pending || live {
+        return Err(failed("dispose the live or pending view before configuring its resource profile"));
+    }
+    threert_render::resource_profile::set_browser_profile(profile).map_err(failed)?;
+    Ok(resource_profile_json().to_string())
 }
 
 /// Small, content-free diagnostics for a host's teardown/reinitialization checks.
@@ -152,7 +174,7 @@ pub fn session_state() -> String {
     });
     let pending_frames = FRAME_WAITERS.with_borrow(HashMap::len);
     json!({ "generation": generation.to_string(), "pending": pending, "hasView": live.is_some(), "pendingFrameWaits": pending_frames,
-        "view": live, "resources": resources }).to_string()
+        "view": live, "resources": resources, "resourceProfile": resource_profile_json() }).to_string()
 }
 
 fn thrown(e: api::Error) -> JsValue {
@@ -467,6 +489,9 @@ pub fn start(canvas: web_sys::HtmlCanvasElement, width: u32, height: u32, info: 
     if let Err(e) = lifecycle::validate_output(width, height) {
         return js_sys::Promise::reject(&js_sys::TypeError::new(e));
     }
+    if let Err(e) = threert_render::resource_profile::current().validate_output(width, height) {
+        return js_sys::Promise::reject(&js_sys::TypeError::new(e));
+    }
     if !scale.is_finite() || !info.is_object() {
         return js_sys::Promise::reject(&js_sys::TypeError::new("start: scale must be finite and info must be an object"));
     }
@@ -536,6 +561,7 @@ async fn start_view(canvas: web_sys::HtmlCanvasElement, width: u32, height: u32,
         "timestamps": timestamps,
         "merged": core.g.merged,
         "loop_guard": gpu::loop_guard(),
+        "resourceProfile": resource_profile_json(),
         "limits": { "maxStorageBuffersPerShaderStage": limits.max_storage_buffers_per_shader_stage, "maxBufferSize": limits.max_buffer_size, "maxStorageBufferBindingSize": limits.max_storage_buffer_binding_size },
         "triangles": core.triangles,
         "ms": { "gpu": t_gpu - t0, "view": js_sys::Date::now() - t_gpu },
