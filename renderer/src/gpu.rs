@@ -1473,6 +1473,23 @@ pub const F_AERIAL: u32 = 1 << 24;
 /// Marks a model instance's custom data (bit 23); group instances then stay below it.
 pub const INSTANCE_BIT: u32 = 1 << 23;
 
+/// Supply dependent overrides explicitly for WebGPU implementations that cannot evaluate their default
+/// expressions. Keep the shader's default for other callers, and use the same stride as the CPU object table.
+/// The entry-point lists are checked against Naga's static reachability, including the default's dependencies:
+/// older WebKit also rejects constants that the selected entry point does not use.
+fn kernel_pipeline_constants(features: u32, live: bool, entry: &str) -> Vec<(&'static str, f64)> {
+    match entry {
+        "main" | "media_train" | "translucent" | "volume_train" => vec![
+            ("LIVE", if live { 1.0 } else { 0.0 }),
+            ("FEAT", features as f64),
+            ("OBJECT_STRIDE", crate::scene::object_stride(features & F_TINT != 0) as f64),
+        ],
+        "media_composite" => vec![("LIVE", if live { 1.0 } else { 0.0 }), ("FEAT", features as f64)],
+        "cache_resolve" | "translucent_up" => vec![],
+        _ => panic!("unknown kernel entry point: {entry}"),
+    }
+}
+
 /// Whether some traversal group starts beyond what instance custom data holds (see F_HUGE): 24 bits, or 23 when
 /// model instances take the top bit.
 pub fn huge(groups: [usize; GROUPS], instanced: bool) -> bool {
@@ -1850,7 +1867,7 @@ impl Gpu {
             .entry((k.features, k.hash, live, k.caps))
             .or_insert_with(|| {
                 let module = self.kernel_module(k);
-                let constants = [("LIVE", if live { 1.0 } else { 0.0 }), ("FEAT", k.features as f64)];
+                let constants = kernel_pipeline_constants(k.features, live, "main");
                 let p = self.device.create_compute_pipeline(&wgpu::ComputePipelineDescriptor {
                     label: Some(if live { "pathtrace-live" } else { "pathtrace" }),
                     layout: Some(&self.pipeline_layout),
@@ -1911,7 +1928,7 @@ impl Gpu {
             .entry((k.features, k.hash, entry, k.caps))
             .or_insert_with(|| {
                 let module = self.kernel_module(k);
-                let constants = [("LIVE", 1.0), ("FEAT", k.features as f64)];
+                let constants = kernel_pipeline_constants(k.features, true, entry);
                 let p = self.device.create_compute_pipeline(&wgpu::ComputePipelineDescriptor {
                     label: Some(entry),
                     layout: Some(&self.pipeline_layout),
@@ -1933,8 +1950,8 @@ impl Gpu {
             .entry((k.features, k.hash, live))
             .or_insert_with(|| {
                 let module = self.kernel_module(k);
-                let constants = [("LIVE", if live { 1.0 } else { 0.0 }), ("FEAT", k.features as f64)];
                 let make = |entry: &str| {
+                    let constants = kernel_pipeline_constants(k.features, live, entry);
                     self.device.create_compute_pipeline(&wgpu::ComputePipelineDescriptor {
                         label: Some(entry),
                         layout: self.tl_pipeline_layout.as_ref(),
@@ -3781,6 +3798,67 @@ mod tests {
         let words: Vec<u32> = bytemuck::cast_slice(&out.slice(..).get_mapped_range().unwrap()).to_vec();
         assert_eq!(words[..2], [11, 22]);
     }
+
+    // Browser override compatibility regression: also run by the focused source-extraction harness.
+    /// Each entry point receives exactly its statically used overrides. Explicit object stride bypasses old
+    /// WebKit's dependent-default evaluator, while cache/composite/upscale passes receive no unused stride key.
+    /// Exercise the production WGSL translator, compiler reachability and specialization against CPU packing.
+    #[test]
+    fn browser_pipeline_overrides_match_entry_points_and_object_packing() {
+        use std::collections::BTreeSet;
+        let mobile = crate::merged::Caps {
+            tables: crate::merged::TABLE_MIN,
+            live: [65_536, 65_536 * 8, 65_536 * 2, 2 * 64 * 36, 64 * 36, 64 * 36],
+        };
+        for variant in [
+            KernelVariant::new(false, Default::default(), 0),
+            KernelVariant { merged: Some(mobile), guard: Some(65_536), ..KernelVariant::new(false, Default::default(), F_UNITS) },
+            KernelVariant { uniform_tables: true, ..KernelVariant::new(false, Default::default(), F_UNITS) },
+            KernelVariant::new(true, Default::default(), 0),
+        ] {
+            let src = kernel_wgsl(&kernel_template(), &variant);
+            let module = naga::front::wgsl::parse_str(&src).unwrap_or_else(|e| panic!("{}", e.emit_to_string(&src)));
+            let info = naga::valid::Validator::new(naga::valid::ValidationFlags::all(), naga::valid::Capabilities::all()).validate(&module).unwrap();
+            let (_, stride_default) = module.overrides.iter().find(|(_, o)| o.name.as_deref() == Some("OBJECT_STRIDE")).unwrap();
+            assert!(matches!(module.global_expressions[stride_default.init.unwrap()], naga::Expression::Select { .. }),
+                "preserve the dependent default for callers that do not supply OBJECT_STRIDE");
+            let expected_entries: BTreeSet<_> = if variant.hwrt {
+                ["main", "media_train", "media_composite", "cache_resolve", "translucent", "volume_train", "translucent_up"].as_slice()
+            } else {
+                ["main", "media_train", "media_composite", "cache_resolve"].as_slice()
+            }.iter().copied().collect();
+            assert_eq!(module.entry_points.iter().map(|e| e.name.as_str()).collect::<BTreeSet<_>>(), expected_entries);
+            for entry in &module.entry_points {
+                let mut reachable = module.clone();
+                reachable.entry_points.retain(|e| e.name == entry.name);
+                naga::compact::compact(&mut reachable, naga::compact::KeepUnused::No);
+                let used: BTreeSet<_> = reachable.overrides.iter().map(|(_, o)| o.name.clone().unwrap()).collect();
+                for tinted in [false, true] {
+                    let features = F_INST | F_MEDIA | if tinted { F_TINT } else { 0 };
+                    let packed_stride = crate::scene::object_stride(tinted) as u32;
+                    assert_eq!(packed_stride, if tinted { 4 } else { 3 });
+                    for live in [false, true] {
+                        let supplied = kernel_pipeline_constants(features, live, &entry.name);
+                        assert_eq!(supplied.iter().map(|(key, _)| key.to_string()).collect::<BTreeSet<_>>(), used,
+                            "entry={} variant={variant:?}", entry.name);
+                        let values = supplied.into_iter().map(|(key, value)| (key.to_string(), value)).collect::<naga::back::PipelineConstants>();
+                        let (specialized, _) = naga::back::pipeline_constants::process_overrides(
+                            &module, &info, Some((entry.stage, &entry.name)), &values).unwrap();
+                        // Naga 30 retains resolved override declarations; their initializers must be literal.
+                        assert!(specialized.overrides.iter().all(|(_, o)| o.init.is_some_and(|init|
+                            matches!(specialized.global_expressions[init], naga::Expression::Literal(_)))),
+                            "all selected overrides must resolve to literals");
+                        if used.contains("OBJECT_STRIDE") {
+                            let (_, stride) = specialized.constants.iter().find(|(_, c)| c.name.as_deref() == Some("OBJECT_STRIDE")).unwrap();
+                            assert_eq!(specialized.global_expressions[stride.init], naga::Expression::Literal(naga::Literal::U32(packed_stride)),
+                                "entry={} tinted={tinted}", entry.name);
+                        }
+                    }
+                }
+            }
+        }
+    }
+    // End browser override compatibility regression.
 
     /// A scene's features other than units are `FEAT` bits, not source: the kernel's text is the same for each, and
     /// what they switch is fixed when a pipeline sets `FEAT` (naga's override processing; `OBJECT_STRIDE` from F_TINT).
