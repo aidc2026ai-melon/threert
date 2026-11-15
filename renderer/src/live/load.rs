@@ -237,7 +237,6 @@ pub(super) fn load_scene(g: &gpu::Gpu, world: &World, assets: &Path, presets: &P
     if let (Some(caps), Some((_, live))) = (&mut up.kernel.caps, &targets.kernel.merged) {
         caps.live = *live;
     }
-    let _ = g.pipeline(&up.kernel, true); // compile the scene's kernel variant now, not in the first frame
     let sky_inputs = ((prep.env.width, prep.env.height), sc.camera.position.y.max(0.0), prep.env_nee_floor);
     let mut base = prep.params;
     // The live viewport resamples fewer light-tree candidates at camera hits than offline renders (ltree.rs).
@@ -305,5 +304,13 @@ pub(super) fn load_scene(g: &gpu::Gpu, world: &World, assets: &Path, presets: &P
         inst_at_load: instances.len(),
         added: Default::default(),
     };
-    Ok((LoadedScene { timings, triangles, tris, tri_nodes, tri_instances, pool_tris, meshes, instances, gpu_instances, procs, proc_of, proc_first, instanced, instance_features, name: sc.name.clone(), up, base, bgs, exposure, exposure_settings, tan_half_fov: c.tan_half_fov, scene_camera, dof: c.dof.clone(), tables, fixed_features, dynamic, edit, sky: None, emit, sky_inputs, mat_runs, tri_order }, sc.preset.post))
+    let (name, tan_half_fov, dof, post) = (sc.name.clone(), c.tan_half_fov, c.dof.clone(), sc.preset.post.clone());
+    // Every live CPU array above was moved out of sc (or is owned by Tables / Uploaded). The remaining scene and
+    // preparation arrays are build scratch: reordered attributes, GPU upload vertices/nodes, and duplicate tables
+    // and unit-tree state. Release them before WGSL compilation needs its own peak of temporary allocations.
+    // In particular, pool_tris / instances remain in LoadedScene for picking; the World remains intact for edits.
+    drop(prep);
+    drop(sc);
+    let _ = g.pipeline(&up.kernel, true); // still compile during start, before publishing the view or its first frame
+    Ok((LoadedScene { timings, triangles, tris, tri_nodes, tri_instances, pool_tris, meshes, instances, gpu_instances, procs, proc_of, proc_first, instanced, instance_features, name, up, base, bgs, exposure, exposure_settings, tan_half_fov, scene_camera, dof, tables, fixed_features, dynamic, edit, sky: None, emit, sky_inputs, mat_runs, tri_order }, post))
 }

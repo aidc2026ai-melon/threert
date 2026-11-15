@@ -1105,6 +1105,44 @@ fn merged_table_bytes(bytes: [u64; 7]) -> ([u32; 7], u64) {
     (caps, crate::merged::offsets(&crate::merged::TABLES, &caps).1)
 }
 
+/// The common instanced-mesh scene already has a contiguous upload table. Borrow it instead of copying all
+/// records into temporary WASM memory. Procedural records still follow mesh records in the combined table.
+fn upload_instance_records<'a>(instances: &'a [crate::scene::GpuInstance], procedural: &[crate::scene::GpuInstance]) -> std::borrow::Cow<'a, [crate::scene::GpuInstance]> {
+    if procedural.is_empty() {
+        std::borrow::Cow::Borrowed(instances)
+    } else {
+        std::borrow::Cow::Owned(instances.iter().chain(procedural).copied().collect())
+    }
+}
+
+#[cfg(test)]
+mod upload_instance_records_tests {
+    use super::*;
+
+    #[test]
+    fn ordinary_instances_are_borrowed_without_changing_the_record_bytes() {
+        let instances = [crate::scene::GpuInstance { info: [17, 3, 9, 1], ..Default::default() },
+            crate::scene::GpuInstance { info: [29, 4, 5, 2], ..Default::default() }];
+        let records = upload_instance_records(&instances, &[]);
+        assert!(matches!(&records, std::borrow::Cow::Borrowed(_)));
+        assert!(std::ptr::eq(records.as_ptr(), instances.as_ptr()));
+        assert_eq!(bytemuck::cast_slice::<_, u8>(&records), bytemuck::cast_slice::<_, u8>(&instances));
+        assert!(matches!(upload_instance_records(&[], &[]), std::borrow::Cow::Borrowed(_)));
+    }
+
+    #[test]
+    fn procedural_records_keep_their_order_and_owned_lifetime() {
+        let instances = [crate::scene::GpuInstance { info: [17, 3, 9, 1], ..Default::default() }];
+        let records = {
+            let procedural = [crate::scene::GpuInstance { info: [29, 4, 5, 2], ..Default::default() }];
+            upload_instance_records(&instances, &procedural)
+        };
+        assert!(matches!(&records, std::borrow::Cow::Owned(_)));
+        assert_eq!(records.iter().map(|r| r.info[0]).collect::<Vec<_>>(), [17, 29]);
+        assert_eq!(records[1].info, [29, 4, 5, 2]);
+    }
+}
+
 #[cfg(test)]
 mod web_storage_limits_tests {
     use super::*;
@@ -1998,7 +2036,7 @@ impl Gpu {
             b.unmap();
             b
         };
-        let records: Vec<crate::scene::GpuInstance> = scene.gpu_instances.iter().chain(&scene.proc_records).copied().collect();
+        let records = upload_instance_records(&scene.gpu_instances, &scene.proc_records);
         // (Software traversal's units have room as hardware traversal's instances do: `prepare` sized their trees'
         // by the same figures.)
         let room = EditRoom::for_scene(scene, tri_verts.len() / 3, records.len(), self.hwrt, scene.units.is_some());
