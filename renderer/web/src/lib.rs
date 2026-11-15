@@ -28,6 +28,9 @@ use threert_render::{api, files, gpu};
 use wasm_bindgen::prelude::*;
 
 mod lifecycle;
+mod gpu_health;
+mod frame_probe;
+use gpu_health::GpuHealth;
 
 /// What scene code edits through `__engine`: as the native `ScriptHost`'s.
 #[derive(Default)]
@@ -58,21 +61,24 @@ struct View {
     /// The first frame: when its recording began (the page's clock, ms) and, once the GPU has finished it, how long
     /// that took (f64 bits; 0: not yet). The kernels and the passes are compiled by the browser when they first run.
     first: (f64, std::sync::Arc<std::sync::atomic::AtomicU64>),
+    health: GpuHealth,
+    frame_checks: Vec<gpu_health::ScopeCheck>,
 }
 
 impl Drop for View {
     fn drop(&mut self) {
         // An explicit teardown is a normal GPUDevice.lost reason="destroyed", not a rendering failure.
-        self.core.g.device.destroy();
+        self.health.close();
     }
 }
 
 /// Covers every Result-returning initialization failure after device acquisition, including LiveCore::new.
-struct PendingDevice(Option<wgpu::Device>);
+struct PendingDevice { device: Option<wgpu::Device>, health: Option<GpuHealth> }
 
 impl Drop for PendingDevice {
     fn drop(&mut self) {
-        if let Some(device) = self.0.take() {
+        if let Some(health) = self.health.take() { health.close(); self.device.take(); }
+        if let Some(device) = self.device.take() {
             device.destroy();
         }
     }
@@ -92,6 +98,7 @@ thread_local! {
     static SESSION: RefCell<lifecycle::Lifecycle> = RefCell::default();
     static FRAME_WAITERS: RefCell<HashMap<u64, (js_sys::Function, js_sys::Function)>> = RefCell::default();
     static NEXT_FRAME_WAITER: Cell<u64> = const { Cell::new(0) };
+    static ACTIVE_HEALTH: RefCell<Option<GpuHealth>> = const { RefCell::new(None) };
 }
 
 fn current(generation: u64) -> bool {
@@ -105,6 +112,7 @@ fn aborted() -> JsValue {
 }
 
 fn drop_view() {
+    if let Some(health) = ACTIVE_HEALTH.with_borrow_mut(Option::take) { health.close(); }
     // A cancelled host frame must not wait for a slow compile or revive when an old device completes later.
     let waiting = FRAME_WAITERS.with_borrow_mut(std::mem::take);
     for (_, (_, reject)) in waiting {
@@ -175,6 +183,13 @@ pub fn session_state() -> String {
     let pending_frames = FRAME_WAITERS.with_borrow(HashMap::len);
     json!({ "generation": generation.to_string(), "pending": pending, "hasView": live.is_some(), "pendingFrameWaits": pending_frames,
         "view": live, "resources": resources, "resourceProfile": resource_profile_json() }).to_string()
+}
+
+/// Device/pipeline failures and positive first-output verification, independent of queue completion timing.
+#[wasm_bindgen(js_name = gpuHealth)]
+pub fn gpu_health() -> String {
+    ACTIVE_HEALTH.with_borrow(|health| health.as_ref().map(GpuHealth::snapshot)
+        .unwrap_or_else(|| json!({ "status": "ok", "stage": "idle", "firstFrameVerified": false }))).to_string()
 }
 
 fn thrown(e: api::Error) -> JsValue {
@@ -507,13 +522,26 @@ pub fn start(canvas: web_sys::HtmlCanvasElement, width: u32, height: u32, info: 
 async fn start_view(canvas: web_sys::HtmlCanvasElement, width: u32, height: u32, info: Value, scale: f32, fps: u32, guard: u32, generation: u64) -> Result<String, JsValue> {
     if !current(generation) { return Err(aborted()); }
     let t0 = js_sys::Date::now();
-    let result = gpu::Gpu::new_async_cancelable(|| !current(generation)).await;
+    let observed_health = RefCell::new(None);
+    let result = gpu::Gpu::new_async_cancelable_observed(|| !current(generation), |device| {
+        let health = GpuHealth::new(device).map_err(|e| std::io::Error::other(format!("GPU observation: {e:?}")))?;
+        health.begin_scopes("device-setup").map_err(|e| std::io::Error::other(format!("GPU device scope: {e:?}")))?;
+        ACTIVE_HEALTH.with_borrow_mut(|slot| *slot = Some(health.clone()));
+        *observed_health.borrow_mut() = Some(health);
+        Ok(())
+    }).await;
+    let health = observed_health.into_inner();
     if !current(generation) {
-        if let Ok(g) = result { g.device.destroy(); }
+        if let Some(health) = health { health.close(); }
+        else if let Ok(g) = result { g.device.destroy(); }
         return Err(aborted());
     }
-    let g = result.map_err(failed)?;
-    let mut pending_device = PendingDevice(Some(g.device.clone()));
+    let g = match result { Ok(g) => g, Err(e) => { if let Some(health) = health { health.close(); } return Err(failed(e)); } };
+    let health = health.ok_or_else(|| failed("GPU health observation was not installed"))?;
+    let mut pending_device = PendingDevice { device: Some(g.device.clone()), health: Some(health.clone()) };
+    health.check_scopes(health.end_scopes()?).await?;
+    if !current(generation) { return Err(aborted()); }
+    health.begin_scopes("scene-upload-and-pipelines")?;
     // Set this only for the current session, after the awaits that another start can supersede.
     gpu::set_loop_guard(if guard == 0 { 65_536 } else { guard });
     let t_gpu = js_sys::Date::now();
@@ -555,6 +583,7 @@ async fn start_view(canvas: web_sys::HtmlCanvasElement, width: u32, height: u32,
         core.render_scale = scale.clamp(threert_render::live::MIN_SCALE, 1.0);
     }
     let (blit, blit_bg) = make_blit(&core, format, sw, sh);
+    health.check_scopes(health.end_scopes()?).await?;
     let out = json!({
         "adapter": { "name": adapter.name, "vendor": adapter.vendor, "device": adapter.device, "backend": format!("{:?}", adapter.backend), "type": format!("{:?}", adapter.device_type) },
         "format": format!("{format:?}"),
@@ -571,8 +600,9 @@ async fn start_view(canvas: web_sys::HtmlCanvasElement, width: u32, height: u32,
     let scene_cam = core.scene_camera();
     if !current(generation) { return Err(aborted()); }
     // From this point View owns device destruction, including any future explicit replacement.
-    pending_device.0.take();
-    let next = View { core, surface, canvas, config, blit, blit_bg, clock: 0.0, has_frame: info["frame"].as_bool().unwrap_or(false), has_on: on("on"), scene_cam, fps: fps.max(1), lockstep: false, first: (0.0, Default::default()) };
+    pending_device.device.take();
+    pending_device.health.take();
+    let next = View { core, surface, canvas, config, blit, blit_bg, clock: 0.0, has_frame: info["frame"].as_bool().unwrap_or(false), has_on: on("on"), scene_cam, fps: fps.max(1), lockstep: false, first: (0.0, Default::default()), health, frame_checks: Vec::new() };
     let old = VIEW.replace(Some(next));
     drop(old);
     Ok(out.to_string())
@@ -635,29 +665,41 @@ pub fn resize_surface(width: u32, height: u32) -> Result<(), JsValue> {
 }
 
 /// Backpressure for the JS host: await all work submitted before this call before submitting another frame.
-/// Wgpu also invokes its completion callback on queue/device error, so this notification is not a GPU health
-/// assertion: retain the host's device-loss/uncaptured-error checks. Explicit teardown rejects with AbortError.
+/// Unlike wgpu's callback, this preserves rejected queue fences, checks GPU errors, and verifies sampled first
+/// output writes. It cannot prove image correctness or presentation. Explicit teardown rejects with AbortError.
 #[wasm_bindgen(js_name = waitForFrame)]
 pub fn wait_for_frame() -> js_sys::Promise {
-    let queue = VIEW.with_borrow(|v| v.as_ref().map(|v| v.core.g.queue.clone()));
-    let Some(queue) = queue else {
+    let pending = VIEW.with_borrow_mut(|v| v.as_mut().map(|v| (v.health.clone(), v.core.g.device.clone(),
+        v.core.g.queue.clone(), v.core.targets.out.clone(), v.core.w, v.core.h,
+        v.first.0, v.first.1.clone(), std::mem::take(&mut v.frame_checks))));
+    let Some((health, device, queue, output, width, height, began, first, checks)) = pending else {
         return js_sys::Promise::reject(&failed("no view: `start` has not resolved"));
     };
     let generation = SESSION.with_borrow(|s| s.snapshot().0);
     let id = NEXT_FRAME_WAITER.with(|n| { let id = n.get().wrapping_add(1); n.set(id); id });
-    js_sys::Promise::new(&mut |resolve, reject| {
+    let promise = js_sys::Promise::new(&mut |resolve, reject| {
         FRAME_WAITERS.with_borrow_mut(|w| w.insert(id, (resolve, reject)));
-        queue.on_submitted_work_done(move || {
-            let callbacks = FRAME_WAITERS.with_borrow_mut(|w| w.remove(&id));
-            if let Some((resolve, reject)) = callbacks {
-                if SESSION.with_borrow(|s| s.snapshot().0) == generation {
-                    let _ = resolve.call0(&JsValue::UNDEFINED);
-                } else {
-                    let _ = reject.call1(&JsValue::UNDEFINED, &aborted());
-                }
+    });
+    wasm_bindgen_futures::spawn_local(async move {
+        let result = async {
+            if SESSION.with_borrow(|s| s.snapshot().0) != generation { return Err(aborted()); }
+            health.check_scopes(checks).await?;
+            health.wait_submission().await?;
+            if SESSION.with_borrow(|s| s.snapshot().0) != generation { return Err(aborted()); }
+            health.verify_first_frame(device, queue, output, width, height).await?;
+            if SESSION.with_borrow(|s| s.snapshot().0) != generation { return Err(aborted()); }
+            health.check()?;
+            if first.load(std::sync::atomic::Ordering::Relaxed) == 0 {
+                first.store((web_time_now() - began).max(f64::EPSILON).to_bits(), std::sync::atomic::Ordering::Relaxed);
             }
-        });
-    })
+            Ok(())
+        }.await;
+        let callbacks = FRAME_WAITERS.with_borrow_mut(|w| w.remove(&id));
+        if let Some((resolve, reject)) = callbacks {
+            match result { Ok(()) => { let _ = resolve.call0(&JsValue::UNDEFINED); }, Err(e) => { let _ = reject.call1(&JsValue::UNDEFINED, &e); } }
+        }
+    });
+    promise
 }
 
 fn view<T>(f: impl FnOnce(&mut View) -> Result<T, JsValue>) -> Result<T, JsValue> {
@@ -696,6 +738,7 @@ pub fn set_lockstep(on: bool) -> Result<(), JsValue> {
 #[wasm_bindgen(js_name = frameBegin)]
 pub fn frame_begin(dt: f32) -> Result<bool, JsValue> {
     view(|v| {
+        v.health.check()?;
         v.core.fixed_dt = v.lockstep.then_some(dt);
         v.core.advance_time(dt);
         let frames = v.has_frame || v.has_on || engine(|e| e.physics.is_some());
@@ -718,6 +761,8 @@ pub fn frame_begin(dt: f32) -> Result<bool, JsValue> {
 #[wasm_bindgen(js_name = frameEnd)]
 pub fn frame_end(dt: f32) -> Result<String, JsValue> {
     view(|v| {
+        v.health.begin_scopes("frame-submit")?;
+        let result = (|| {
         let now = web_time_now;
         let p0 = now();
         engine(|e| {
@@ -749,8 +794,6 @@ pub fn frame_end(dt: f32) -> Result<String, JsValue> {
         let p3 = now();
         if v.first.0 == 0.0 {
             v.first.0 = p2;
-            let done = v.first.1.clone();
-            v.core.g.queue.on_submitted_work_done(move || done.store((web_time_now() - p2).to_bits(), std::sync::atomic::Ordering::Relaxed));
         }
         v.core.govern_resolution(v.fps);
         let physics = engine(|e| e.physics.as_mut().map(|p| p.take_stats()));
@@ -773,6 +816,9 @@ pub fn frame_end(dt: f32) -> Result<String, JsValue> {
             "guard_trips": v.core.guard_trips,
         })
         .to_string())
+        })();
+        v.frame_checks = v.health.end_scopes()?;
+        result
     })
 }
 

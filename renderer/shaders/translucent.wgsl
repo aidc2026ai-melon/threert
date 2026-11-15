@@ -58,7 +58,8 @@
 // material function.
 @if(hwrt) fn particle_material(ti: u32, b: vec2<f32>, view: vec3<f32>, lod: f32) -> MatOut {
     let a = attrs[ti];
-    let m = material_at(bitcast<u32>(a.uv.w));
+    var m: Material;
+    material_load(bitcast<u32>(a.uv.w), &m);
     let uv = mesh_uv(a, m, b.x, b.y);
     let tl = mesh_lod(a, m) + lod - LOD_BIAS;
     var r = mat_base(m);

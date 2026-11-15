@@ -16,6 +16,15 @@ const canvas = { width: 160, height: 90 };
 const start = () => wasm.start(canvas, 160, 90, '{}', 1, 60, 8192);
 const cancelled = (promise) => assert.rejects(promise, (e) => e.name === 'AbortError');
 
+test('GPU readiness is not claimed without a verified live frame', async () => {
+  wasm.reset();
+  assert.deepEqual(JSON.parse(wasm.gpuHealth()), { status: 'ok', stage: 'idle', firstFrameVerified: false });
+  const pending = start();
+  wasm.dispose();
+  await cancelled(pending);
+  assert.equal(JSON.parse(wasm.gpuHealth()).firstFrameVerified, false);
+});
+
 test('dispose cancels a start before its first async poll', async () => {
   wasm.reset();
   const p = start();

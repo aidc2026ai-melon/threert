@@ -148,7 +148,7 @@ struct Instance { m0: vec4<f32>, m1: vec4<f32>, m2: vec4<f32>, n0: vec4<f32>, n1
 // simulated grid), (majorant 1/m, HG anisotropy, -, -), customData, parameters.
 struct Medium { w0: vec4<f32>, w1: vec4<f32>, w2: vec4<f32>, a: vec4<u32>, b: vec4<f32>, c: vec4<f32>, p: array<vec4<f32>, 8> };
 
-// The scene's tables, read through `material_at`, `light_at`, `emitter_at`, `tex_info_at`, `object_at`, `instance_at`
+// The scene's tables, read through `material_load`, `light_at`, `emitter_at`, `tex_info_at`, `object_at`, `instance_at`
 // and `medium_at` in every layout:
 //  - materials (scene::GpuMaterial), lights (scene::GpuLight);
 //  - emitters: (triangle index bits, cumulative weight (normalized), weight, area) for i < counts.y, then the guide
@@ -170,7 +170,8 @@ struct Medium { w0: vec4<f32>, w1: vec4<f32>, w2: vec4<f32>, a: vec4<u32>, b: ve
         media: array<Medium, MT_MEDIA>,
     };
     @group(0) @binding(4) var<storage, read> MT: MergedTables;
-    fn material_at(i: u32) -> Material { return MT.materials[i]; }
+    // Keep material reads out of the large-aggregate function-return ABI; the complete record is unchanged.
+    fn material_load(i: u32, out: ptr<function, Material>) { *out = MT.materials[i]; }
     fn light_at(i: u32) -> Light { return MT.lights[i]; }
     fn emitter_at(i: u32) -> vec4<f32> { return MT.emitters[i]; }
     fn tex_info_at(i: u32) -> vec4<f32> { return MT.tex_info[i]; }
@@ -181,7 +182,7 @@ struct Medium { w0: vec4<f32>, w1: vec4<f32>, w2: vec4<f32>, a: vec4<u32>, b: ve
     @group(0) @binding(4) var<storage, read> materials: array<Material>;
     @group(0) @binding(5) var<storage, read> lights: array<Light>;
     @group(0) @binding(6) var<storage, read> emitters: array<vec4<f32>>;
-    fn material_at(i: u32) -> Material { return materials[i]; }
+    fn material_load(i: u32, out: ptr<function, Material>) { *out = materials[i]; }
     fn light_at(i: u32) -> Light { return lights[i]; }
     fn emitter_at(i: u32) -> vec4<f32> { return emitters[i]; }
     @if(uniform_tables) {
@@ -404,7 +405,9 @@ fn emitter_sel(ti: u32, x: vec3<f32>, n: vec3<f32>) -> f32 {
         if (P.misc.y <= 0.0 || (has(F_PEMIT) && a.x.z < 0.0)) { return 0.0; }
         var area = 0.5 * length(cross(tri_verts[ti * 3u + 1u].xyz, tri_verts[ti * 3u + 2u].xyz));
         if (has(F_PEMIT) && a.x.z > 0.0) { area = a.x.z; }
-        return luminance(material_at(bitcast<u32>(a.uv.w)).emissive.rgb) * obj_power(a) * area / P.misc.y;
+        var m: Material;
+        material_load(bitcast<u32>(a.uv.w), &m);
+        return luminance(m.emissive.rgb) * obj_power(a) * area / P.misc.y;
     }
     let depth = (code >> LT_PATH_BITS) - 1u;
     var p = 1.0 - P.ltree.z;
@@ -798,7 +801,8 @@ fn glass_at(h: Hit, d: vec3<f32>, t: f32) -> GlassAt {
         e2 = inst_vec(r, e2);
         a = inst_attr(r, a);
     }
-    let m = material_at(bitcast<u32>(a.uv.w));
+    var m: Material;
+    material_load(bitcast<u32>(a.uv.w), &m);
     var g = GlassAt(normalize(cross(e1, e2)), 0.0, false, vec3<f32>(1.0));
     var tr = clamp(m.layer.x, 0.0, 1.0) * (1.0 - clamp(m.params.x, 0.0, 1.0));
     if (tr <= 0.0) { return g; }
@@ -1065,7 +1069,8 @@ fn obj_power(a: TriAttr) -> f32 { return object_at(object_of(a) * OBJECT_STRIDE)
 // Inputs at a point of triangle ti (barycentrics u, v) for material functions outside full shading (alpha, NEE).
 fn mat_in_at(ti: u32, u: f32, v: f32, view: vec3<f32>, lod: f32) -> MatIn {
     let a = attrs[ti];
-    let m = material_at(bitcast<u32>(a.uv.w));
+    var m: Material;
+    material_load(bitcast<u32>(a.uv.w), &m);
     let w = 1.0 - u - v;
     let p = tri_verts[ti * 3u].xyz + tri_verts[ti * 3u + 1u].xyz * u + tri_verts[ti * 3u + 2u].xyz * v;
     let ng = normalize(cross(tri_verts[ti * 3u + 1u].xyz, tri_verts[ti * 3u + 2u].xyz));
@@ -1095,7 +1100,8 @@ fn cutouts_opaque() -> bool {
 // the model instance a pool triangle belongs to (its scale shifts the texel density, as in `inst_attr`), or NO_INST.
 fn alpha_pass(ti: u32, inst: u32, u: f32, v: f32, t: f32) -> bool {
     let a = attrs[ti];
-    let m = material_at(bitcast<u32>(a.uv.w));
+    var m: Material;
+    material_load(bitcast<u32>(a.uv.w), &m);
     var alpha = m.base_color.a;
     var lod = mesh_lod(a, m) + log2(max(t * 2.0 * P.cam_pos.w / lod_height(), 1e-7)) - LOD_BIAS;
     if (has(F_INST) && inst != NO_INST) { lod += bitcast<f32>(instance_at(inst).info.z); }
@@ -1136,7 +1142,8 @@ fn surface(o: vec3<f32>, d: vec3<f32>, h: Hit, width: f32) -> Surface {
     var ng = normalize(cross(e1, e2));
     var n = normalize(a.n0.xyz * w + a.n1.xyz * h.u + a.n2.xyz * h.v);
     let mi = bitcast<u32>(a.uv.w);
-    let m = material_at(mi);
+    var m: Material;
+    material_load(mi, &m);
     let front = dot(ng, d) < 0.0;
     if (!front) { ng = -ng; }
     if (dot(n, ng) < 0.0) { n = -n; }
@@ -1227,7 +1234,8 @@ fn surface_proc(o: vec3<f32>, d: vec3<f32>, h: Hit, width: f32) -> Surface {
     let r = instance_at(h.inst);
     let hd = r.info.x;
     let mi = pword(pword(hd + 7u) + min((h.tri >> 23u) & 0xffu, pword(hd + 3u) - 1u));
-    let m = material_at(mi);
+    var m: Material;
+    material_load(mi, &m);
     let oi = r.info.y;
     var ng = proc_normal(h);
     let front = dot(ng, d) < 0.0;
@@ -1583,7 +1591,8 @@ fn emit_mis(hit: Hit, d: vec3<f32>, pdf: f32) -> f32 {
     let area = 0.5 * length(cr);
     let cos_l = abs(dot(normalize(cr), d));
     let ha = attrs[hit.tri];
-    let mat = material_at(bitcast<u32>(ha.uv.w));
+    var mat: Material;
+    material_load(bitcast<u32>(ha.uv.w), &mat);
     let pdf_a = luminance(mat.emissive.rgb) * obj_power(ha) / P.emit_power.x;
     let pdf_w = pdf_a * hit.t * hit.t / max(cos_l, 1e-6);
     if (!has(F_PEMIT) || ha.x.z == 0.0) { return power_heuristic(pdf, pdf_w); }
@@ -1844,7 +1853,8 @@ struct ES { le: vec3<f32>, l: vec3<f32>, dist: f32, pdf_w: f32, w: f32 };
 fn emitter_radiance(ti: u32, b1: f32, b2: f32, l: vec3<f32>) -> vec3<f32> {
     let a = attrs[ti];
     let mi = bitcast<u32>(a.uv.w);
-    let m = material_at(mi);
+    var m: Material;
+    material_load(mi, &m);
     // 5 cm footprint: a blurred texel is plenty for lighting and keeps NEE cheap.
     let pw = obj_power(a);
     var le = emission(m, mesh_uv(a, m, b1, b2), mesh_lod(a, m) + log2(0.05)) * pw;
@@ -1927,7 +1937,9 @@ fn sample_emitter_ris(x: vec3<f32>, n: vec3<f32>, m: u32, sf: Surface, lb: Lobes
     let dist = sqrt(d2);
     let l = dl / dist;
     var cos_l = dot(ln, -l);
-    let m_card = material_at(bitcast<u32>(attrs[ti].uv.w)).tex1.z == MAT_EMITTER_CARD;
+    var emitter_material: Material;
+    material_load(bitcast<u32>(attrs[ti].uv.w), &emitter_material);
+    let m_card = emitter_material.tex1.z == MAT_EMITTER_CARD;
     if (!m_card) { cos_l = abs(cos_l); }
     if (cos_l <= 0.0) { return r; }
     r.le = emitter_radiance(ti, pick_b.x, pick_b.y, l);
@@ -1964,7 +1976,8 @@ fn sample_emitter(x: vec3<f32>, n: vec3<f32>, rd: u32) -> ES {
     let l = dl / dist;
     let a = attrs[ti];
     let mi = bitcast<u32>(a.uv.w);
-    let m = material_at(mi);
+    var m: Material;
+    material_load(mi, &m);
     var cos_l = dot(ln, -l);
     if (m.tex1.z != MAT_EMITTER_CARD) { cos_l = abs(cos_l); }
     if (cos_l <= 0.0 || (has(F_PEMIT) && !(cos_l > 0.0))) { return r; } // also a particle not shown (no area: NaN)

@@ -44,13 +44,30 @@ it does not shrink `WebAssembly.Memory` or promise an immediate operating-system
 After `dispose()`, `frameBegin`, `frameEnd`, `click`, `commit`, `resizeSurface` and `waitForFrame` reject until a new start resolves.
 After `reset()`, existing JS binding caches are invalid: reusing them can skip uploads of now-missing engine handles.
 
-`sessionState().pendingFrameWaits` counts outstanding queue notifications. The host should normally have at most
+`sessionState().pendingFrameWaits` counts outstanding frame checks. The host should normally have at most
 one: `frameBegin(dt)` / script / `frameEnd(dt)` / `await waitForFrame()`, then schedule the next animation frame.
 Wgpu 30's WebGPU backend calls its completion callback on both successful completion and an error rejection of
-the underlying queue promise. Therefore `waitForFrame()` supplies backpressure, not proof of correct pixels or
-device health. Keep device-loss/uncaptured-error and loop-guard checks. Waiting does not itself submit a frame.
+the underlying queue promise. This wrapper instead awaits the raw WebGPU promise and error-scope results, observes
+device loss, and registers uncaptured errors with `addEventListener` (avoiding WebKit's event-handler setter bug).
+The first successful wait also reads nine dispersed output words through one transient 36-byte buffer, verifies
+the post shader wrote opaque alpha, and destroys the readback buffer. Waiting does not itself render a frame.
 After the await, check the host's own generation/disposed flag again before submitting: teardown can happen after
 a completion promise has already resolved, in which case it is too late to reject that settled promise.
+
+`gpuHealth()` returns JSON with `status`, `stage`, `firstFrameVerified`, and optional `errorType`, `message`, and
+`probe` (`sampledPixels`, `nonzeroRgbSamples`, per-channel byte arrays `rgbMin`/`rgbMax`). Mobile hosts must wait for
+`waitForFrame()` and require status `ok` plus `firstFrameVerified: true` before announcing readiness. Continue
+checking health during rendering and idle periods. Error/loss or rejected waits require session teardown and host
+fallback. The observer closes before intentional device destruction, and late events cannot affect a new session.
+
+`firstFrameVerified` means sampled GPU output writes were confirmed. It does not prove correct lighting, every
+pixel, canvas presentation, or target-device rendering. Opaque black is permitted; an upstream silent miscompile
+that still writes opaque black can pass. RGB diagnostics help distinguish that case without rejecting valid dark
+scenes. Real browser/GPU screenshots and real iPhone validation remain necessary.
+
+Material accessors use a function output pointer instead of returning a 288-byte aggregate. This preserves
+material contents, layout, lighting and scene scope while avoiding a large-return call shape implicated in
+WebKit bug 323560. It is a compatibility mitigation, not proof that the reported phone failure had that cause.
 
 ## Camera and selection integration
 

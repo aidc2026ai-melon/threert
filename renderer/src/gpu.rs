@@ -1616,6 +1616,15 @@ impl Gpu {
     }
 
     async fn new_async_with_cancel(options: GpuOptions, cancelled: impl Fn() -> bool) -> Result<Gpu> {
+        Self::new_async_observed(options, cancelled, |_| Ok(())).await
+    }
+
+    /// A browser host can install error/loss observation before any device resources are created.
+    pub async fn new_async_cancelable_observed(cancelled: impl Fn() -> bool, observe: impl Fn(&wgpu::Device) -> Result<()>) -> Result<Gpu> {
+        Self::new_async_observed(GpuOptions::from_env(), cancelled, observe).await
+    }
+
+    async fn new_async_observed(options: GpuOptions, cancelled: impl Fn() -> bool, observe: impl Fn(&wgpu::Device) -> Result<()>) -> Result<Gpu> {
         if cancelled() {
             return Err(anyhow!("GPU initialization cancelled"));
         }
@@ -1671,6 +1680,10 @@ impl Gpu {
         if cancelled() {
             device.destroy();
             return Err(anyhow!("GPU initialization cancelled"));
+        }
+        if let Err(error) = observe(&device) {
+            device.destroy();
+            return Err(error);
         }
         let pipeline_cache = cache_feature.and_then(|_| crate::pipeline_cache::PipelineCache::open(&device, options.pipeline_cache.as_ref()?, &adapter_info));
         let uniform_tables = options.uniform_tables_on(merged, cfg!(target_os = "android"));

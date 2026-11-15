@@ -4,7 +4,7 @@
 //!
 //! The kernel's source has both layouts: pathtrace.wgsl declares its tables and its group-1 buffers in an
 //! `@if(merged) { .. } @else { .. }` block each (WESL's conditional translation, `gpu::KernelVariant`), and reads and
-//! writes them only through functions declared in each (`material_at`, `cache_acc_add`, `refl_store`, ...). This
+//! writes them only through functions declared in each (`material_load`, `cache_acc_add`, `refl_store`, ...). This
 //! module is the Rust side's half: which buffers are merged, the lengths of the merged structs' arrays (WESL constants
 //! the source imports, `gpu::KernelVariant::constants`) and where the arrays are, for the buffers the renderer makes
 //! and copies. `THREERT_MERGED=1` runs the same layout natively (software traversal), so the tests that check the
@@ -227,6 +227,34 @@ mod tests {
         let (_, cache_size) = m.constants.iter().find(|(_, k)| k.name.as_deref() == Some("CACHE_SIZE")).expect("CACHE_SIZE");
         assert_eq!(m.global_expressions[cache_size.init], naga::Expression::Literal(naga::Literal::U32(crate::gpu::CACHE_SIZE as u32)));
         assert_eq!(crate::gpu::CACHE_SIZE, 262_144);
+    }
+
+    /// Material reads avoid a large aggregate return without changing the CPU/GPU record layout. Validate the
+    /// output-pointer call sites in software, merged mobile, uniform-table and hardware/translucent variants.
+    #[test]
+    fn material_load_uses_function_output_in_all_layouts() {
+        let mut mobile = caps();
+        mobile.live[..3].copy_from_slice(&[65_536, 65_536 * 8, 65_536 * 2]);
+        for v in [
+            KernelVariant::new(false, Default::default(), 0),
+            KernelVariant { merged: Some(mobile), guard: Some(65_536), ..KernelVariant::new(false, Default::default(), crate::gpu::F_SOURCE) },
+            KernelVariant { uniform_tables: true, ..KernelVariant::new(false, Default::default(), crate::gpu::F_SOURCE) },
+            KernelVariant::new(true, Default::default(), 0),
+        ] {
+            let (m, info) = parse(&kernel_wgsl(&kernel_template(), &v));
+            let (material, _) = m.types.iter().find(|(_, t)| t.name.as_deref() == Some("Material")).expect("Material");
+            assert_eq!(layout(&m, "Material").1, std::mem::size_of::<crate::scene::GpuMaterial>() as u64);
+            let (_, load) = m.functions.iter().find(|(_, f)| f.name.as_deref() == Some("material_load")).expect("material_load");
+            assert!(load.result.is_none(), "material_load must not return a large aggregate");
+            assert_eq!(load.arguments.len(), 2);
+            assert!(matches!(m.types[load.arguments[1].ty].inner, naga::TypeInner::Pointer { base, space: naga::AddressSpace::Function } if base == material));
+            assert!(!m.functions.iter().any(|(_, f)| f.result.as_ref().is_some_and(|r| r.ty == material)), "no Material-returning accessor may remain");
+            if v.merged.is_some() {
+                let (used, declared) = storage_buffers(&m, &info);
+                assert!(declared as u32 <= STORAGE_BUFFERS && used.iter().all(|p| p.1 as u32 <= STORAGE_BUFFERS));
+                assert_eq!(layout(&m, "MergedTables"), offsets(&TABLES, &mobile.tables));
+            }
+        }
     }
 
     /// Every kernel variant with the uniform tables: valid WGSL; the four tables are uniform buffers at their own

@@ -125,7 +125,9 @@
 // An alpha-cutout triangle: its material has an alpha test (as the build flags TRI_MASKED; model instances' pool
 // triangles carry no flags).
 @if(hwrt) fn cutout(ti: u32) -> bool {
-    return material_at(bitcast<u32>(attrs[ti].uv.w)).uv2.w > 0.0;
+    var m: Material;
+    material_load(bitcast<u32>(attrs[ti].uv.w), &m);
+    return m.uv2.w > 0.0;
 }
 
 // The model-instance record a hit's custom data names (F_INST), or NO_INST for a traversal group.
