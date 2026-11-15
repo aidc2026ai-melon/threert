@@ -431,9 +431,8 @@ fn exposure_snap() -> bool {
 /// UE's physical CoC model (DiaphragmDOFUtils.cpp, FPhysicalCocModel::Compile): focal length from the sensor height
 /// (sensor width / aspect) and the vertical FOV, the CoC of infinity on the sensor f^2 / (N (focus - f)), as a radius in
 /// output pixels; max radius r.DOF.Kernel.Max{Fore,Back}groundRadius = 2.5 % of the width. Off without a focus distance.
-fn dof_params(dof: Option<&crate::desc::Dof>, tan_half_fov: f32, w: u32, h: u32) -> [f32; 4] {
+fn dof_params(dof: Option<&crate::desc::Dof>, tan_half_fov: f32, w: u32, aspect: f32) -> [f32; 4] {
     let Some(d) = dof.filter(|d| d.focus_distance > 0.0 && d.f_stop > 0.0 && d.sensor_width > 0.0) else { return [0.0; 4] };
-    let aspect = w as f32 / h as f32;
     let sensor_h = d.sensor_width / aspect;
     let f = 0.5 * sensor_h / tan_half_fov;
     let diameter = f * f / (d.f_stop * (d.focus_distance * 1000.0 - f).max(1e-3));
@@ -862,6 +861,72 @@ impl LiveCore {
 
     pub fn aspect(&self) -> f32 {
         self.aspect
+    }
+
+    /// Read-only diagnostic source: the last traced grid, before denoising, exposure and tonemapping.
+    /// Pixel is five vec4<f32> (80 bytes); retain the recorded grid, not a newly governed next-frame size.
+    pub fn traced_signal_buffer(&self) -> (wgpu::Buffer, u32, u32) {
+        (self.sc.up.accum.clone(), self.prev_isz.0, self.prev_isz.1)
+    }
+
+    /// Keep the physical presentation aspect independent of the fixed-size tracing buffers.
+    /// A rotated/resized browser view can fill its canvas without allocating a second scene
+    /// or stretching the camera projection. The host validates positive, finite dimensions.
+    pub fn set_presentation_aspect(&mut self, aspect: f32) {
+        if aspect.is_finite() && aspect > 0.0 && self.aspect != aspect {
+            self.aspect = aspect;
+            self.reset = true;
+            self.sc.base.light_lod[3] = 0.0;
+        }
+    }
+
+    /// Actual storage-buffer sizes, not a sum of unrelated allocations compared with a
+    /// single-binding limit. Aliased live ranges are represented by their shared allocation.
+    /// Textures, driver memory, particles and CPU/WASM memory are outside this diagnostic.
+    pub fn storage_buffer_diagnostics(&self) -> serde_json::Value {
+        let up = &self.sc.up;
+        let kernel = &self.targets.kernel;
+        let mut entries: Vec<(&str, u64)> = vec![
+            ("scene nodes", up.bg_parts.nodes.size()), ("scene vertices", up.verts.size()),
+            ("scene attributes", up.attrs.size()), ("previous vertices", up.prev_verts.size()),
+            ("scene energy", up.bg_parts.energy.size()), ("scene cdf", up.cdf.size()),
+            ("accumulation", up.accum.size()),
+        ];
+        let merged_scene = up.tables.as_ref().map_or(0, wgpu::Buffer::size);
+        if let Some(tables) = &up.tables {
+            entries.push(("merged scene", tables.size()));
+        } else {
+            for (label, buffer) in [("materials", &up.materials), ("lights", &up.lights),
+                ("emitters", &up.emitters), ("texture info", &up.bg_parts.texinfo),
+                ("objects", &up.objects), ("instances", &up.instances), ("media", &up.media)] {
+                entries.push((label, buffer.size()));
+            }
+        }
+        let merged_live = kernel.merged.as_ref().map_or(0, |(buffer, _)| buffer.size());
+        if let Some((buffer, _)) = &kernel.merged {
+            entries.push(("merged live", buffer.size()));
+        } else {
+            for (label, buffer) in [("cache keys", &kernel.cache.keys), ("cache sums", &kernel.cache.acc),
+                ("cache values", &kernel.cache.val), ("reflection rays", &kernel.refl),
+                ("motion", &kernel.motion), ("direct light", &kernel.direct)] {
+                entries.push((label, buffer.size));
+            }
+            if let Some(buffer) = &kernel.guard { entries.push(("loop guard", buffer.size)); }
+        }
+        for (binding, buffer) in &self.targets.bufs {
+            let name = layout::BINDINGS.iter().find(|b| b.binding == *binding).expect("live buffer binding").name;
+            entries.push((name, buffer.size));
+        }
+        let limits = self.g.device.limits();
+        let largest = entries.iter().max_by_key(|(_, size)| *size).copied().unwrap_or(("none", 0));
+        serde_json::json!({
+            "scope": "scene-and-frame-storage-buffers",
+            "largestBinding": { "label": largest.0, "bytes": largest.1 },
+            "largestMergedBindingBytes": merged_scene.max(merged_live),
+            "mergedSceneBytes": merged_scene, "mergedLiveBytes": merged_live,
+            "bindingLimitBytes": (limits.max_storage_buffer_binding_size as u64).min(limits.max_buffer_size),
+            "entries": entries.into_iter().map(|(label, bytes)| serde_json::json!({ "label": label, "bytes": bytes })).collect::<Vec<_>>(),
+        })
     }
 
     /// Primary ray through (u, v) of the image (0..1, v down), as the path tracer generates it.

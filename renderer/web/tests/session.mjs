@@ -93,6 +93,7 @@ test('frame and resize after dispose are explicit errors, not use-after-free', a
   assert.throws(() => wasm.frameBegin(1 / 60), /no view/);
   assert.throws(() => wasm.frameEnd(1 / 60), /no view/);
   assert.throws(() => wasm.resizeSurface(320, 180), /no view/);
+  assert.throws(() => wasm.resizeSurface(320, 180, 393 / 852), /no view/);
   await assert.rejects(wasm.waitForFrame(), /no view/);
   assert.equal(state().pendingFrameWaits, 0);
   wasm.dispose();

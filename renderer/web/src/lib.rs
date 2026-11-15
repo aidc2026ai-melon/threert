@@ -188,8 +188,27 @@ pub fn session_state() -> String {
 /// Device/pipeline failures and positive first-output verification, independent of queue completion timing.
 #[wasm_bindgen(js_name = gpuHealth)]
 pub fn gpu_health() -> String {
-    ACTIVE_HEALTH.with_borrow(|health| health.as_ref().map(GpuHealth::snapshot)
-        .unwrap_or_else(|| json!({ "status": "ok", "stage": "idle", "firstFrameVerified": false }))).to_string()
+    let mut state = ACTIVE_HEALTH.with_borrow(|health| health.as_ref().map(GpuHealth::snapshot)
+        .unwrap_or_else(|| json!({ "status": "ok", "stage": "idle", "firstFrameVerified": false })));
+    VIEW.with_borrow(|v| { if let Some(v) = v {
+        state["buffers"] = v.core.storage_buffer_diagnostics();
+        state["limits"] = limits_json(&v.core);
+        state["presentation"] = presentation_json(&v.core, v.config.width, v.config.height);
+    }});
+    state.to_string()
+}
+
+fn limits_json(core: &LiveCore) -> Value {
+    let limits = core.g.device.limits();
+    let adapter = core.g.adapter.limits();
+    json!({ "maxStorageBuffersPerShaderStage": limits.max_storage_buffers_per_shader_stage,
+        "maxBufferSize": limits.max_buffer_size, "maxStorageBufferBindingSize": limits.max_storage_buffer_binding_size,
+        "adapterMaxBufferSize": adapter.max_buffer_size, "adapterMaxStorageBufferBindingSize": adapter.max_storage_buffer_binding_size })
+}
+
+fn presentation_json(core: &LiveCore, sw: u32, sh: u32) -> Value {
+    json!({ "surfaceWidth": sw, "surfaceHeight": sh, "outputWidth": core.w, "outputHeight": core.h,
+        "cameraAspect": core.aspect(), "mode": "fill" })
 }
 
 fn thrown(e: api::Error) -> JsValue {
@@ -460,12 +479,9 @@ fn texel(x: i32, y: i32) -> vec4<f32> {
 
 @fragment fn fs(@builtin(position) p: vec4<f32>) -> @location(0) vec4<f32> {
     let dims = vec2<f32>(W, H);
-    // Presentation can resize without reallocating the renderer's output. Preserve its aspect and letterbox;
-    // click() uses the same transform, so the bars never select geometry.
-    let fit = min(SW / W, SH / H);
-    let shown = dims * fit;
-    let uv = (p.xy - (vec2<f32>(SW, SH) - shown) * 0.5) / shown;
-    if any(uv < vec2<f32>(0.0)) || any(uv >= vec2<f32>(1.0)) { return vec4<f32>(0.0, 0.0, 0.0, 1.0); }
+    // Camera projection follows the physical viewport aspect, independent of this fixed pixel budget.
+    // Fill the surface: rotation needs neither letterbox bars nor a replacement scene allocation.
+    let uv = p.xy / vec2<f32>(SW, SH);
     let q = uv * dims - 0.5;
     let f = fract(q);
     let i = vec2<i32>(floor(q));
@@ -565,7 +581,6 @@ async fn start_view(canvas: web_sys::HtmlCanvasElement, width: u32, height: u32,
         return Err(failed("start: canvas exceeds this device's maxTextureDimension2D"));
     }
     surface.configure(&g.device, &config);
-    let limits = g.device.limits();
     let adapter = g.adapter_info.clone();
     let timestamps = g.timestamps;
     // As `GameSession::start`: the setup's changes are the scene the view is built from, not edits of it; a voxel
@@ -578,6 +593,7 @@ async fn start_view(canvas: web_sys::HtmlCanvasElement, width: u32, height: u32,
         LiveCore::new(g, &e.world, Path::new(""), Path::new(""), width, height)
     })
     .map_err(failed)?;
+    core.set_presentation_aspect(sw as f32 / sh as f32);
     core.dynamic_res = scale <= 0.0;
     if scale > 0.0 {
         core.render_scale = scale.clamp(threert_render::live::MIN_SCALE, 1.0);
@@ -591,7 +607,9 @@ async fn start_view(canvas: web_sys::HtmlCanvasElement, width: u32, height: u32,
         "merged": core.g.merged,
         "loop_guard": gpu::loop_guard(),
         "resourceProfile": resource_profile_json(),
-        "limits": { "maxStorageBuffersPerShaderStage": limits.max_storage_buffers_per_shader_stage, "maxBufferSize": limits.max_buffer_size, "maxStorageBufferBindingSize": limits.max_storage_buffer_binding_size },
+        "limits": limits_json(&core),
+        "buffers": core.storage_buffer_diagnostics(),
+        "presentation": presentation_json(&core, sw, sh),
         "triangles": core.triangles,
         "ms": { "gpu": t_gpu - t0, "view": js_sys::Date::now() - t_gpu },
         "load": core.load_timings().iter().map(|(k, v)| (k.clone(), json!(v))).collect::<serde_json::Map<_, _>>(),
@@ -642,15 +660,19 @@ fn make_blit(core: &LiveCore, format: wgpu::TextureFormat, sw: u32, sh: u32) -> 
     (blit, blit_bg)
 }
 
-/// Resizes only the presentation surface. The fixed RT output is bilinearly enlarged/letterboxed, so this does not
-/// add detail or resize its storage targets. For a different RT resolution use start() with new width/height.
+/// Resizes presentation and its camera projection, retaining the fixed tracing/storage budget.
+/// `aspect`, when supplied, is the exact CSS viewport width / height, before pixel-budget rounding.
+/// Call only after the host's current frame fence/capture completes. More detail still needs a new start().
 #[wasm_bindgen(js_name = resizeSurface)]
-pub fn resize_surface(width: u32, height: u32) -> Result<(), JsValue> {
+pub fn resize_surface(width: u32, height: u32, aspect: Option<f32>) -> Result<(), JsValue> {
     view(|v| {
         let max = v.core.g.device.limits().max_texture_dimension_2d;
         if width == 0 || height == 0 || width > max || height > max {
             return Err(js_sys::TypeError::new("resizeSurface: dimensions must be nonzero and within maxTextureDimension2D").into());
         }
+        let aspect = lifecycle::presentation_aspect(width, height, aspect)
+            .map_err(|message| js_sys::TypeError::new(message))?;
+        v.core.set_presentation_aspect(aspect);
         if (width, height) == (v.config.width, v.config.height) && (width, height) == (v.canvas.width(), v.canvas.height()) { return Ok(()); }
         let (blit, blit_bg) = make_blit(&v.core, v.config.format, width, height);
         v.canvas.set_width(width);
@@ -670,9 +692,9 @@ pub fn resize_surface(width: u32, height: u32) -> Result<(), JsValue> {
 #[wasm_bindgen(js_name = waitForFrame)]
 pub fn wait_for_frame() -> js_sys::Promise {
     let pending = VIEW.with_borrow_mut(|v| v.as_mut().map(|v| (v.health.clone(), v.core.g.device.clone(),
-        v.core.g.queue.clone(), v.core.targets.out.clone(), v.core.w, v.core.h,
+        v.core.g.queue.clone(), v.core.targets.out.clone(), v.core.w, v.core.h, v.core.traced_signal_buffer(),
         v.first.0, v.first.1.clone(), std::mem::take(&mut v.frame_checks))));
-    let Some((health, device, queue, output, width, height, began, first, checks)) = pending else {
+    let Some((health, device, queue, output, width, height, signal, began, first, checks)) = pending else {
         return js_sys::Promise::reject(&failed("no view: `start` has not resolved"));
     };
     let generation = SESSION.with_borrow(|s| s.snapshot().0);
@@ -686,7 +708,7 @@ pub fn wait_for_frame() -> js_sys::Promise {
             health.check_scopes(checks).await?;
             health.wait_submission().await?;
             if SESSION.with_borrow(|s| s.snapshot().0) != generation { return Err(aborted()); }
-            health.verify_first_frame(device, queue, output, width, height).await?;
+            health.verify_first_frame(device, queue, output, width, height, signal).await?;
             if SESSION.with_borrow(|s| s.snapshot().0) != generation { return Err(aborted()); }
             health.check()?;
             if first.load(std::sync::atomic::Ordering::Relaxed) == 0 {

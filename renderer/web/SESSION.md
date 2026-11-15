@@ -49,8 +49,12 @@ one: `frameBegin(dt)` / script / `frameEnd(dt)` / `await waitForFrame()`, then s
 Wgpu 30's WebGPU backend calls its completion callback on both successful completion and an error rejection of
 the underlying queue promise. This wrapper instead awaits the raw WebGPU promise and error-scope results, observes
 device loss, and registers uncaptured errors with `addEventListener` (avoiding WebKit's event-handler setter bug).
-The first successful wait also reads nine dispersed output words through one transient 36-byte buffer, verifies
-the post shader wrote opaque alpha, and destroys the readback buffer. Waiting does not itself render a frame.
+The first successful wait reads nine dispersed output words plus nine 80-byte traced signal records through one
+transient 756-byte buffer, verifies the post shader wrote opaque alpha, and destroys the readback buffer. The
+linear signal probe reports diffuse + emission + specular RGB before post-processing and counts nonfinite
+components. It uses the last rendered grid (not the next frame's dynamically governed dimensions). The two
+probes distinguish sampled kernel black from post-output black; neither reads displayed canvas pixels.
+Waiting does not itself render a frame.
 After the await, check the host's own generation/disposed flag again before submitting: teardown can happen after
 a completion promise has already resolved, in which case it is too late to reject that settled promise.
 
@@ -79,8 +83,14 @@ Use the existing world API for camera controls; it survives view-only dispose/re
   this function supplies defaults for fields that are omitted.
 - `commit(seq)` or the next `frameEnd(dt)` applies changes and follows the active scene camera.
 
-`click(u,v)` accepts normalized canvas coordinates, top-left origin, and maps through the same letterbox as the
-blit shader. A bar returns no hit. A hit identifies the object's name and optional instanceId; the RHODE adapter
+`resizeSurface(width, height, aspect?)` fills the presentation surface while retaining all fixed tracing buffers.
+Its camera projection follows `aspect` (the exact CSS width / height), or width / height if omitted. Coalesce
+resizes while a frame fence or capture is pending and apply them before the next frame. An aspect change resets
+temporal history, updates primary/raster/CPU-picking projection, and never reloads the model. Output resolution
+can differ from presentation resolution; this changes sampling density, not scene proportions.
+
+`click(u,v)` accepts normalized canvas coordinates, top-left origin, matching the full-surface blit.
+A hit identifies the object's name and optional instanceId; the RHODE adapter
 must retain the name/instance-slot to source-object mapping. CPU pick cost on a large model remains a separate
 runtime measurement. Camera near/far descriptor fields are not a BIM section/clipping-plane implementation.
 
@@ -97,9 +107,18 @@ The `start()` JSON `load` object includes `merged_tables_bytes`, `instance_recor
 `object_records_bytes`. Dynamic arena growth beyond the initial upload remains a separate path; these startup
 checks do not claim to validate every future resource mutation.
 
+Both `start()` and live `gpuHealth()` report device and adapter limits separately in `limits`, actual scene/frame
+storage sizes in `buffers`, and current output/surface dimensions and camera aspect in `presentation`. Compare
+`largestBinding.bytes` or `largestMergedBindingBytes` with `bindingLimitBytes`; never compare a sum of buffers
+with the per-binding limit. `entries` describe the scene and frame storage bindings (merged aliases counted once),
+not total GPU memory: texture/driver/particle/CPU/WASM allocations are excluded. Existing preflight rejects each
+oversized binding before creation. The output probe explicitly reports `source: post-tonemap-output` and RGB
+channel order; `kernelProbe` reports `source: pathtrace-linear-signals`, linear RGB bounds, sampled/nonzero pixel
+counts and `nonfiniteComponents`. Neither reads the presented canvas or proves a physically displayed pixel.
+
 ## Focused verification
 
-`renderer/web/src/lifecycle.rs` has pure Rust epoch, size and letterbox mapping tests. With a freshly built web
+`renderer/web/src/lifecycle.rs` has pure Rust epoch, size, exact aspect and rotated full-canvas picking tests. With a freshly built web
 package, `node --test renderer/web/tests/session.mjs` exercises the actual WASM exports without a browser/GPU.
 Set `THREERT_WEB_PKG` to the generated package directory if it is not `out/web/dist/pkg`.
 

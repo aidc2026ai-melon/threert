@@ -222,7 +222,6 @@ impl LiveCore {
     /// from that direction (the kernel's emitter pdfs read the same reference from the parameters).
     pub(super) fn update_light_lod(&mut self) {
         let d0 = LIGHT_LOD_D0;
-        let (w, h) = (self.w, self.h);
         let b = &mut self.sc.base;
         // The light tree weighs emitters by their distance to each shading point itself: no light LOD, no cull.
         if d0 <= 0.0 || self.sc.tables.emitter_tris.is_empty() || b.ltree[3] > 0.5 {
@@ -238,7 +237,7 @@ impl LiveCore {
         b.emit_power[1] = EMITTER_CULL;
         b.emit_power[2] = EMITTER_CULL * EMITTER_CULL_VIEW;
         // The frustum's half-diagonal: tan = tan(fov / 2) x sqrt(1 + aspect^2).
-        let half = (self.cam.tan_half_fov * (1.0 + (w as f32 / h as f32).powi(2)).sqrt()).atan() + EMITTER_CULL_MARGIN.to_radians();
+        let half = (self.cam.tan_half_fov * (1.0 + self.aspect.powi(2)).sqrt()).atan() + EMITTER_CULL_MARGIN.to_radians();
         b.lod_view = [self.cam.fwd.x, self.cam.fwd.y, self.cam.fwd.z, half.min(std::f32::consts::PI).cos()];
         // Power edits held back for the emitter worker land first (its job in flight was built for the old reference:
         // dropped), so the CDF built here has the powers the objects hold and the reference the kernel reads.
@@ -517,7 +516,7 @@ impl LiveCore {
             br2: [r[4], r[5], 0.0, 0.0],
             bt: [t[0], t[1], t[2], t[3]],
             bt2: [t[4], t[5], 0.0, 0.0],
-            dof: dof_params(self.sc.dof.as_ref(), cam.tan_half_fov, w, h),
+            dof: dof_params(self.sc.dof.as_ref(), cam.tan_half_fov, w, self.aspect),
             jit: [jitter.0, jitter.1, 0.0, 0.0],
             state: [1 - self.frame % 2, 0, 0, 0],
             lt: [tile_at.0, tile_at.1, lists, layout::light_tiles(iw)],

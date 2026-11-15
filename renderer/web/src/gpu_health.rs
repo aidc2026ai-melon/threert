@@ -30,6 +30,7 @@ struct Status {
     error: Option<(String, String)>,
     first_frame_verified: bool,
     probe: Option<(usize, usize, [u8; 3], [u8; 3])>,
+    kernel_probe: Option<frame_probe::SignalBounds>,
 }
 
 fn record(state: &Weak<RefCell<Status>>, kind: &str, message: &str) {
@@ -127,7 +128,9 @@ impl GpuHealth {
         let mut out = json!({ "status": if s.error.is_some() { "error" } else { "ok" },
             "stage": if s.active { s.stage.as_str() } else { "disposed" }, "firstFrameVerified": s.first_frame_verified });
         if let Some((kind, message)) = &s.error { out["errorType"] = json!(kind); out["message"] = json!(message); }
-        if let Some((sampled, nonzero, min, max)) = s.probe { out["probe"] = json!({"sampledPixels": sampled, "nonzeroRgbSamples": nonzero, "rgbMin": min, "rgbMax": max}); }
+        if let Some((sampled, nonzero, min, max)) = s.probe { out["probe"] = json!({"source": "post-tonemap-output", "channelOrder": "RGB", "sampledPixels": sampled, "nonzeroRgbSamples": nonzero, "rgbMin": min, "rgbMax": max}); }
+        if let Some(p) = &s.kernel_probe { out["kernelProbe"] = json!({"source": "pathtrace-linear-signals", "channelOrder": "RGB", "sampledPixels": p.samples,
+            "nonzeroRgbSamples": p.nonzero, "nonfiniteComponents": p.nonfinite, "rgbMin": p.min, "rgbMax": p.max}); }
         out
     }
 
@@ -180,17 +183,23 @@ impl GpuHealth {
     /// A dark frame is valid. The post shader writes alpha=255 even for black, whereas an unwritten output is 0.
     /// Nine dispersed output words catch an invalid/no-op first dispatch without copying or retaining the image.
     /// This verifies output writes, not image correctness or presentation; an opaque black miscompile can pass.
-    pub async fn verify_first_frame(&self, device: wgpu::Device, queue: wgpu::Queue, output: wgpu::Buffer, width: u32, height: u32) -> Result<(), JsValue> {
+    pub async fn verify_first_frame(&self, device: wgpu::Device, queue: wgpu::Queue, output: wgpu::Buffer, width: u32, height: u32, signal: (wgpu::Buffer, u32, u32)) -> Result<(), JsValue> {
         self.check()?;
         if self.0.state.borrow().first_frame_verified { return Ok(()); }
         self.begin_scopes("first-frame-readback")?;
-        let read = device.create_buffer(&wgpu::BufferDescriptor { label: Some("first frame probe"), size: 36,
+        let has_signal = signal.1 > 0 && signal.2 > 0;
+        let read = device.create_buffer(&wgpu::BufferDescriptor { label: Some("first frame probe"), size: if has_signal { 756 } else { 36 },
             usage: wgpu::BufferUsages::MAP_READ | wgpu::BufferUsages::COPY_DST, mapped_at_creation: false });
         *self.0.probe.borrow_mut() = Some(read.clone());
         let _lease = ProbeLease { health: self.clone(), buffer: read.clone() };
         let mut encoder = device.create_command_encoder(&Default::default());
         for (n, offset) in frame_probe::offsets(width, height).into_iter().enumerate() {
             encoder.copy_buffer_to_buffer(&output, offset, &read, n as u64 * 4, 4);
+        }
+        if has_signal {
+            for (n, offset) in frame_probe::offsets(signal.1, signal.2).into_iter().enumerate() {
+                encoder.copy_buffer_to_buffer(&signal.0, offset * 20, &read, 36 + n as u64 * 80, 80);
+            }
         }
         queue.submit([encoder.finish()]);
         let checks = self.end_scopes()?;
@@ -204,12 +213,14 @@ impl GpuHealth {
             self.check_scopes(checks).await?;
             let values = Uint32Array::new(&call(&raw, "getMappedRange", &[])?) .to_vec();
             call(&raw, "unmap", &[])?;
-            let nonzero = frame_probe::validate(&values).map_err(|e| self.error("GPU_FIRST_FRAME_UNWRITTEN", &e.into()))?;
+            let output_words = values.get(..9).ok_or_else(|| self.error("GPU_FIRST_FRAME_UNWRITTEN", &"Incomplete output readback".into()))?;
+            let nonzero = frame_probe::validate(output_words).map_err(|e| self.error("GPU_FIRST_FRAME_UNWRITTEN", &e.into()))?;
             self.check()?;
             let mut s = self.0.state.borrow_mut();
             s.first_frame_verified = true;
-            let (min, max) = frame_probe::rgb_bounds(&values);
-            s.probe = Some((values.len(), nonzero, min, max));
+            let (min, max) = frame_probe::rgb_bounds(output_words);
+            s.probe = Some((output_words.len(), nonzero, min, max));
+            if has_signal { s.kernel_probe = Some(frame_probe::signal_bounds(&values[9..])); }
             s.stage = "rendering".into();
             Ok(())
         }.await;

@@ -45,15 +45,17 @@ pub(crate) fn validate_output(width: u32, height: u32) -> Result<(), &'static st
     Ok(())
 }
 
-/// Normalized canvas coordinates -> normalized fixed-output coordinates (the BLIT shader's letterbox).
+pub(crate) fn presentation_aspect(width: u32, height: u32, aspect: Option<f32>) -> Result<f32, &'static str> {
+    let aspect = aspect.unwrap_or(width as f32 / height as f32);
+    if !aspect.is_finite() || aspect <= 0.0 { return Err("resizeSurface: aspect must be positive and finite"); }
+    Ok(aspect)
+}
+
+/// The camera follows the presentation aspect and the BLIT fills the canvas, so picking
+/// retains normalized coordinates even when output and surface have different pixel ratios.
 pub(crate) fn surface_pick(u: f32, v: f32, width: u32, height: u32, sw: u32, sh: u32) -> Option<(f32, f32)> {
     if !u.is_finite() || !v.is_finite() || width == 0 || height == 0 || sw == 0 || sh == 0 { return None; }
-    let (w, h, sw, sh) = (width as f32, height as f32, sw as f32, sh as f32);
-    let fit = (sw / w).min(sh / h);
-    let (shown_w, shown_h) = (w * fit, h * fit);
-    let x = (u * sw - (sw - shown_w) * 0.5) / shown_w;
-    let y = (v * sh - (sh - shown_h) * 0.5) / shown_h;
-    ((0.0..1.0).contains(&x) && (0.0..1.0).contains(&y)).then_some((x, y))
+    ((0.0..1.0).contains(&u) && (0.0..1.0).contains(&v)).then_some((u, v))
 }
 
 #[cfg(test)]
@@ -101,11 +103,22 @@ mod tests {
     }
 
     #[test]
-    fn resized_presentation_picks_the_image_and_excludes_letterbox_bars() {
+    fn rotated_presentation_picks_the_full_canvas_without_letterbox_bars() {
         assert_eq!(surface_pick(0.5, 0.5, 160, 90, 200, 200), Some((0.5, 0.5)));
-        assert_eq!(surface_pick(0.5, 0.05, 160, 90, 200, 200), None);
-        assert_eq!(surface_pick(0.05, 0.5, 90, 160, 200, 200), None);
+        assert_eq!(surface_pick(0.5, 0.05, 160, 90, 200, 200), Some((0.5, 0.05)));
+        assert_eq!(surface_pick(0.05, 0.5, 90, 160, 200, 200), Some((0.05, 0.5)));
         assert_eq!(surface_pick(0.25, 0.75, 160, 90, 320, 180), Some((0.25, 0.75)));
         assert_eq!(surface_pick(f32::NAN, 0.5, 160, 90, 320, 180), None);
+        assert_eq!(surface_pick(1.1, 0.5, 160, 90, 200, 200), None);
+        assert_eq!(surface_pick(0.5, 0.5, 160, 90, 0, 200), None);
+    }
+
+    #[test]
+    fn exact_css_aspect_can_differ_from_rounded_pixel_budget() {
+        assert_eq!(presentation_aspect(160, 90, None), Ok(160.0 / 90.0));
+        assert_eq!(presentation_aspect(160, 90, Some(393.0 / 852.0)), Ok(393.0 / 852.0));
+        for bad in [0.0, -1.0, f32::NAN, f32::INFINITY] {
+            assert!(presentation_aspect(160, 90, Some(bad)).is_err());
+        }
     }
 }
